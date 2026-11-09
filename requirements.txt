@@ -4,3 +4,4 @@ numpy
 ultralytics
 easyocr
 pillow
+kagglehub
