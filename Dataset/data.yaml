@@ -1,0 +1,7 @@
+path: ./Dataset/Raw/Indonesian License Plate Dataset
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: license_plate

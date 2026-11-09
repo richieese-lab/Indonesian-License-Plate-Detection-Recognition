@@ -1,0 +1,62 @@
+# ==========================================
+# Python & Bytecode
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# ==========================================
+# Jupyter Notebook Checkpoints
+# ==========================================
+.ipynb_checkpoints/
+
+# ==========================================
+# Dataset (PENTING: File zip 2GB & folder gambar)
+# GitHub menolak file > 100 MB
+# ==========================================
+Dataset/Raw/
+Dataset/*.zip
+Dataset/Raw.zip
+Dataset/dataset_plate.zip
+*.zip
+*.tar
+*.gz
+
+# ==========================================
+# Model Weights & Checkpoints
+# File bobot model (.pt) biasanya besar (> 50-100MB)
+# Kecuali jika bobot sengaja di-upload via Git LFS atau Releases
+# ==========================================
+models/*.pt
+models/*.onnx
+runs/
+yolov8*.pt
+
+# ==========================================
+# Output Gambar Intermediate / Hasil Prediksi
+# (Biarkan foldernya ada lewat .gitkeep, tapi abaikan file gambar di dalamnya)
+# ==========================================
+Output/01_cropped_plates/*
+!Output/01_cropped_plates/.gitkeep
+
+Output/02_preprocessed/*
+!Output/02_preprocessed/.gitkeep
+
+Output/03_binarized/*
+!Output/03_binarized/.gitkeep
+
+Output/04_final_detections/*
+!Output/04_final_detections/.gitkeep
+
+# ==========================================
+# IDE & System Files
+# ==========================================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
