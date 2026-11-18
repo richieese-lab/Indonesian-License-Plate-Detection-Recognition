@@ -33,8 +33,10 @@ Dataset/dataset_plate.zip
 # Kecuali jika bobot sengaja di-upload via Git LFS atau Releases
 # ==========================================
 models/*.pt
+!models/best.pt
 models/*.onnx
 runs/
+weights/
 yolov8*.pt
 
 # ==========================================

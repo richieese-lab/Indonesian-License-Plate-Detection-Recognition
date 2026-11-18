@@ -28,7 +28,8 @@ Indonesian License Plate Detection/
 ├── Script/                                        # Modul inti pemrosesan citra
 │   ├── __init__.py
 │   ├── download_dataset.py                        # Script download otomatis via Kaggle API (kagglehub)
-│   ├── detector.py                                # P21: Deteksi plat & rasio aspek (YOLO)
+│   ├── detector.py                                # P21: Deteksi plat, deskewing, warna HSV & polaritas
+│   ├── plate_tax_pipeline.py                      # Pipeline Dual-ROI nomor plat & angka pajak (MM-YY)
 │   ├── preprocessor.py                            # P4: Grayscale & P6: CLAHE
 │   ├── binarizer.py                               # P12: Binarisasi (Adaptive/Otsu Threshold)
 │   ├── recognizer.py                              # EasyOCR & Validasi Pola Plat
@@ -41,9 +42,13 @@ Indonesian License Plate Detection/
 │   ├── 03_binarized/
 │   └── 04_final_detections/
 │
-├── models/                                        # Tempat bobot model (best.pt)
+├── models/
+│   └── best.pt                                    # Bobot terlatih YOLOv8 deteksi plat nomor (mAP@0.5: 97.2%)
 ├── app.py                                         # Aplikasi antarmuka Web berbasis Streamlit
+├── evaluate_plate_tax.py                          # Skrip evaluasi metrik batch nomor plat & angka pajak
+├── test_single_image.py                           # Skrip uji cepat satu gambar via terminal / path
 ├── requirements.txt                               # Dependensi pustaka Python
+├── run_pipeline.ipynb                             # Notebook pipeline utama
 └── run_on_colab.ipynb                             # Notebook untuk eksekusi lengkap via Colab / Kaggle API
 ```
 

@@ -60,6 +60,8 @@ def draw_plate_annotations(image, detections):
             badge_x1 = end_pt[0] - txt_w - 20
             badge_y1 = end_pt[1] - txt_h - 10
 
+        badge_x1 = max(6, min(badge_x1, img_w - txt_w - 22))
+        badge_y1 = max(6, min(badge_y1, img_h - txt_h - 22))
         badge_x2 = badge_x1 + txt_w + 16
         badge_y2 = badge_y1 + txt_h + 16
 
@@ -81,9 +83,12 @@ def get_ground_truth(image_filename, base_project_dir):
     """
     stem = os.path.splitext(image_filename)[0]
     
-    # Lokasi folder labelswithLP di Dataset (mendukung Lokal dan Google Colab)
+    # Lokasi folder labelswithLP di Dataset (mendukung Lokal, KaggleHub Cache, dan Google Colab)
     dataset_dir = os.path.join(base_project_dir, "Dataset", "Raw", "Indonesian License Plate Dataset", "labelswithLP")
-    candidate_dirs = [dataset_dir]
+    kaggle_cache_dir = os.path.expanduser(
+        "~/.cache/kagglehub/datasets/juanthomaswijaya/indonesian-license-plate-dataset/versions/1/Indonesian License Plate Dataset/labelswithLP"
+    )
+    candidate_dirs = [dataset_dir, kaggle_cache_dir]
     
     if not os.path.exists(dataset_dir):
         import glob
