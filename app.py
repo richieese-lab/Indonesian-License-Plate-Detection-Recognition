@@ -29,16 +29,38 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 OUTPUT_DIR = os.path.join(BASE_DIR, "Output")
 
-# Deteksi lokasi folder images/test (mendukung Lokal di Dataset/images maupun Dataset/Raw serta Google Colab)
-CANDIDATE_TEST_DIRS = [
-    os.path.join(BASE_DIR, "Dataset", "images", "Indonesian License Plate Dataset", "images", "test"),
-    os.path.join(BASE_DIR, "Dataset", "Raw", "Indonesian License Plate Dataset", "images", "test"),
-]
-TEST_SET_DIR = next((d for d in CANDIDATE_TEST_DIRS if os.path.exists(d)), CANDIDATE_TEST_DIRS[0])
-if not os.path.exists(TEST_SET_DIR):
-    candidates = [d for d in glob.glob("/content/dataset/**/images/test", recursive=True) if "Recognition" not in d]
-    if candidates:
-        TEST_SET_DIR = candidates[0]
+# Deteksi lokasi folder images/test:
+# Prioritas 1: Akses melalui Kaggle API (kagglehub)
+# Prioritas 2 (Fallback): Gunakan folder Dataset di lokal
+@st.cache_resource
+def get_test_set_dir():
+    try:
+        import kagglehub
+        api_path = kagglehub.dataset_download("juanthomaswijaya/indonesian-license-plate-dataset")
+        api_test_dirs = [
+            d for d in glob.glob(os.path.join(api_path, "**", "images", "test"), recursive=True)
+            if "Recognition" not in d
+        ]
+        if api_test_dirs:
+            return api_test_dirs[0]
+    except Exception:
+        pass
+
+    candidate_test_dirs = [
+        os.path.join(BASE_DIR, "Dataset", "images", "Indonesian License Plate Dataset", "images", "test"),
+        os.path.join(BASE_DIR, "Dataset", "Raw", "Indonesian License Plate Dataset", "images", "test"),
+    ]
+    for d in candidate_test_dirs:
+        if os.path.exists(d):
+            return d
+    if os.path.exists("/content/dataset"):
+        candidates = [d for d in glob.glob("/content/dataset/**/images/test", recursive=True) if "Recognition" not in d]
+        if candidates:
+            return candidates[0]
+    return candidate_test_dirs[0]
+
+
+TEST_SET_DIR = get_test_set_dir()
 
 
 @st.cache_resource

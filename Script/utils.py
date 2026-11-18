@@ -98,19 +98,52 @@ def draw_plate_annotations(image, detections):
     return annotated
 
 
+def resolve_dataset_root(base_project_dir):
+    """
+    Prioritas 1: Akses dataset via Kaggle API (`kagglehub.dataset_download`).
+    Prioritas 2 (Fallback): Gunakan direktori Dataset lokal jika API gagal / offline.
+    """
+    try:
+        import kagglehub
+        api_path = kagglehub.dataset_download("juanthomaswijaya/indonesian-license-plate-dataset")
+        if api_path and os.path.exists(api_path):
+            return api_path
+    except Exception:
+        pass
+
+    local_roots = [
+        os.path.join(base_project_dir, "Dataset", "images"),
+        os.path.join(base_project_dir, "Dataset", "Raw"),
+        os.path.join(base_project_dir, "Dataset"),
+    ]
+    for r in local_roots:
+        if os.path.exists(r):
+            return r
+    return base_project_dir
+
+
 def get_ground_truth(image_filename, base_project_dir):
     """
-    Mencari nilai Ground Truth dari folder labelswithLP (jika gambar berasal dari dataset).
+    Mencari nilai Ground Truth dari folder labelswithLP (prioritas via Kaggle API, fallback ke lokal).
     Format isi file: class_id x_center y_center width height STRING_PLAT
     """
+    import glob
     stem = os.path.splitext(image_filename)[0]
 
-    candidate_dirs = [
+    candidate_dirs = []
+    ds_root = resolve_dataset_root(base_project_dir)
+    if ds_root and os.path.exists(ds_root):
+        found_api_lp = [
+            d for d in glob.glob(os.path.join(ds_root, "**", "labelswithLP"), recursive=True)
+            if "Recognition" not in d
+        ]
+        candidate_dirs.extend(found_api_lp)
+
+    candidate_dirs.extend([
         os.path.join(base_project_dir, "Dataset", "Raw", "Indonesian License Plate Dataset", "labelswithLP"),
         os.path.join(base_project_dir, "Dataset", "images", "Indonesian License Plate Dataset", "labelswithLP"),
-    ]
+    ])
 
-    import glob
     if os.path.exists("/content/dataset"):
         found_lp = [d for d in glob.glob("/content/dataset/**/labelswithLP", recursive=True) if "Recognition" not in d]
         candidate_dirs.extend(found_lp)
