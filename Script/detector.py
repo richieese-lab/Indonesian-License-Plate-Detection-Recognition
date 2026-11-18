@@ -19,6 +19,8 @@ from ultralytics import YOLO
 MAX_SKEW_DEG = 25.0     # kemiringan di atas ini tidak dikoreksi, takut gambarnya malah rusak
 MIN_SKEW_DEG = 0.5      # di bawah ini plat dianggap sudah lurus
 MIN_SKEW_GAIN = 1.05    # rotasi harus menaikkan skor profil minimal 5%, kalau tidak berarti cuma noise
+HOUGH_MIN_SUPPORT = 5.0 # total panjang garis Hough minimal 5x lebar plat baru dipakai sebagai cadangan
+EDGE_MARGIN = 3         # kotak yang jaraknya ke tepi gambar <= 3 px dianggap menempel tepi
 
 VEHICLE_TYPE = {
     "Putih":  "Kendaraan Pribadi (Pelat Putih)",
@@ -79,6 +81,55 @@ def estimate_skew(plate_bgr, max_angle=MAX_SKEW_DEG):
     best = max(fine, key=score)
     gain = score(best) / base if base > 0 else 1.0
     return float(np.clip(best, -max_angle, max_angle)), gain
+
+
+def estimate_skew_hough(plate_bgr, max_angle=MAX_SKEW_DEG):
+    """
+    Estimasi kedua dari garis lurus terpanjang di plat (bingkai atas/bawah plat).
+    Canny dulu untuk dapat tepi (P12), lalu Hough (P17) memvoting garis lurus mana
+    yang dilewati piksel-piksel tepi itu. Sudut garis-garis panjang = sudut plat.
+    Return: (sudut_koreksi, support) atau (None, 0) kalau tidak ada garis yang cukup panjang.
+    support = total panjang garis / lebar plat, makin besar makin kuat buktinya.
+    """
+    gray = _to_gray(plate_bgr)
+    h, w = gray.shape[:2]
+    if w < 40 or h < 12:
+        return None, 0.0
+    scale = 300.0 / w
+    gray = cv2.resize(gray, (300, max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+    w = 300
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    # ambang Canny diambil dari median kecerahan, supaya tidak perlu disetel per foto
+    med = float(np.median(gray))
+    edges = cv2.Canny(gray, int(max(0, 0.66 * med)), int(min(255, 1.33 * med) + 20))
+
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 360, threshold=40,
+                            minLineLength=int(0.35 * w), maxLineGap=int(0.04 * w))
+    if lines is None:
+        return None, 0.0
+
+    angles, weights = [], []
+    # bentuk array hasil HoughLinesP beda antar versi OpenCV, jadi diratakan dulu ke (N, 4)
+    for x1, y1, x2, y2 in np.asarray(lines).reshape(-1, 4):
+        a = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+        if a > 90:
+            a -= 180
+        elif a <= -90:
+            a += 180
+        if abs(a) <= max_angle:
+            angles.append(a)
+            weights.append(float(np.hypot(x2 - x1, y2 - y1)))
+    if not angles:
+        return None, 0.0
+
+    # median berbobot panjang garis: garis bingkai yang panjang lebih dipercaya
+    order = np.argsort(angles)
+    a_sorted = np.array(angles)[order]
+    w_sorted = np.array(weights)[order]
+    cum = np.cumsum(w_sorted)
+    angle = float(a_sorted[np.searchsorted(cum, cum[-1] / 2.0)])
+    return angle, float(cum[-1] / w)
 
 
 def _tighten_after_rotation(img, angle, margin=0.06):
@@ -191,6 +242,12 @@ class PlateDetector:
     def deskew_plate(self, crop_bgr):
         """
         Luruskan plat yang miring, maksimal +/- MAX_SKEW_DEG derajat.
+        Ada dua estimasi sudut:
+          1. Integral proyeksi (P17), dari baris-baris tulisan. Ini estimasi utama.
+          2. Hough (P12 + P17), dari garis bingkai plat. Dipakai untuk konfirmasi,
+             dan jadi cadangan kalau estimasi utama tidak yakin tapi garis bingkainya jelas.
+        Hough tidak dijadikan estimasi utama karena di foto asli sering tertipu garis
+        bemper, plat motor yang melengkung, dan sudut pandang yang miring (perspektif).
         Setelah diputar, area bodi mobil di sekitar plat ikut dipotong.
         Return: (citra_lurus, sudut_koreksi, status)
         """
@@ -198,14 +255,24 @@ class PlateDetector:
             return crop_bgr, 0.0, "Citra kosong"
 
         angle, gain = estimate_skew(crop_bgr)
-        if abs(angle) < MIN_SKEW_DEG:
+        h_angle, support = estimate_skew_hough(crop_bgr)
+        profile_ok = abs(angle) >= MIN_SKEW_DEG and gain >= MIN_SKEW_GAIN
+        hough_ok = h_angle is not None and support >= HOUGH_MIN_SUPPORT and abs(h_angle) >= MIN_SKEW_DEG
+
+        if profile_ok:
+            agree = h_angle is not None and abs(angle - h_angle) <= 2.5
+            source = "proyeksi & Hough sepakat" if agree else "integral proyeksi"
+        elif hough_ok:
+            # estimasi utama ragu, tapi garis bingkai plat panjang dan jelas
+            angle, source = h_angle, "Hough, integral proyeksi kurang yakin"
+        elif abs(angle) < MIN_SKEW_DEG:
             return crop_bgr.copy(), 0.0, "Lurus (tidak dikoreksi)"
-        if gain < MIN_SKEW_GAIN:
+        else:
             return crop_bgr.copy(), 0.0, f"Tidak dikoreksi (estimasi {angle:+.1f} derajat kurang meyakinkan)"
 
         rotated = _rotate(crop_bgr, angle)
         out = _tighten_after_rotation(rotated, angle)
-        status = f"Dikoreksi {angle:+.1f} derajat"
+        status = f"Dikoreksi {angle:+.1f} derajat ({source})"
         if abs(angle) >= MAX_SKEW_DEG - 0.5:
             status += " (mentok batas, cek manual)"
         return out, round(angle, 2), status
@@ -317,6 +384,19 @@ class PlateDetector:
             return aspect_ratio, False, "Tidak Wajar (Rasio Terlalu Panjang)"
         return aspect_ratio, True, "Lengkap"
 
+    @staticmethod
+    def touches_image_edge(box, img_w, img_h, margin=EDGE_MARGIN):
+        """
+        YOLO cuma bisa mengotaki bagian plat yang kelihatan. Kalau plat keluar dari foto,
+        kotaknya akan mentok di tepi gambar. Titik (0, 0) ada di pojok kiri atas, jadi:
+          kiri  -> x1 dekat 0        kanan -> x2 dekat lebar gambar
+          atas  -> y1 dekat 0        bawah -> y2 dekat tinggi gambar
+        Cek rasio aspek saja tidak cukup, karena plat mobil yang terpotong separuh
+        rasionya bisa mirip plat motor yang utuh.
+        """
+        x1, y1, x2, y2 = box
+        return x1 <= margin or y1 <= margin or x2 >= img_w - margin or y2 >= img_h - margin
+
     # ------------------------------------------------------------------
     # Tahap 1: Deteksi & crop
     # ------------------------------------------------------------------
@@ -351,6 +431,9 @@ class PlateDetector:
                     continue
 
                 aspect_ratio, is_complete, status_desc = self.check_aspect_ratio(w, h)
+                if self.touches_image_edge((x1, y1, x2, y2), img_w, img_h):
+                    is_complete = False
+                    status_desc = "Terpotong di Tepi Gambar"
                 crop_img = image[y1:y2, x1:x2]
 
                 det = {
