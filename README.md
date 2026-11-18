@@ -1,97 +1,100 @@
-# Indonesian License Plate Detection & Recognition (ALPR)
-Proyek Akhir Mata Kuliah: **Pengolahan Citra Digital dan Visi Komputer**
+# ALPR Studio Indonesia — Deteksi Pelat Nomor, Klasifikasi Warna & Status Pajak
 
-Sistem ini melakukan lokalisasi pelat nomor kendaraan bermotor Indonesia, peningkatan kualitas citra plat, segmentasi biner, pembacaan teks plat nomor (OCR), serta deteksi otomatis plat yang terhalang/tidak utuh (*partial occlusion*).
+Proyek Akhir Mata Kuliah **Pengolahan Citra Digital dan Visi Komputer**
 
----
-
-## 📚 Penerapan Materi Kuliah Slide
-Proyek ini mengintegrasikan minimal 3 materi kuliah sesuai ketentuan:
-1. **P21. YOLO (Object Detection):** Melokalisasi posisi pelat nomor kendaraan dari citra utuh ke dalam koordinat bounding box dan memotong area ROI plat.
-2. **P4. Konversi Ruang Warna:** Mengubah citra plat hasil crop dari BGR menjadi Grayscale.
-3. **P6. Histogram Processing (CLAHE):** *Contrast Limited Adaptive Histogram Equalization* untuk meratakan dan mempertajam kontras karakter plat terhadap latar belakangnya.
-4. **P12. Segmentasi Dasar:** Menerapkan *Adaptive Gaussian Thresholding* dan *Otsu Thresholding* untuk binarisasi karakter sebelum pembacaan OCR.
-5. **Ekstraksi Fitur & Rasio Aspek (P17) / Validasi Oklusi:** Mendeteksi plat nomor yang terhalang/terpotong berdasarkan rasio aspek dan pola sintaks plat nomor Indonesia.
+Sistem Automatic License Plate Recognition (ALPR) Indonesia berbasis **YOLOv8s**, **OpenCV Digital Image Processing**, dan **EasyOCR** yang dilengkapi kalibrasi ambang deteksi otomatis, koreksi kemiringan (*deskewing*), identifikasi golongan warna kendaraan, serta pembacaan masa berlaku pajak (`MM.YY`).
 
 ---
 
-## 📁 Struktur Direktori
+## Kebaruan Utama (Novelty)
+
+1. **Klasifikasi Warna Pelat & Jenis Kendaraan (Ruang Warna HSV)**
+   - **Hitam**: Kendaraan Pribadi (Format Lama) — polaritas latar gelap & teks terang dipertahankan.
+   - **Putih**: Kendaraan Pribadi (Format Baru) — di-invert agar berstandar latar gelap & teks putih.
+   - **Kuning**: Kendaraan Angkutan Umum / Barang — di-invert serta didukung ekstraksi kanal kontras kuning.
+   - **Merah**: Kendaraan Dinas Pemerintah — polaritas disesuaikan otomatis terhadap kecerahan teks.
+
+2. **Segmentasi Dual-ROI & Validasi Status Pajak (`MM.YY`)**
+   - Memisahkan **ROI Nomor Utama** (`roi_cleaned`) dari **ROI Angka Pajak** (`tax_roi_binary` & `tax_roi_gray` di area tengah-bawah pelat) agar teks dudukan pelat tidak ikut terbaca.
+   - Menerapkan koreksi karakter pajak (`G/O/D/Q/C -> 0`, `I/L -> 1`, `Z -> 2`, `S -> 5`, `B -> 8`) dan membandingkan `(Tahun, Bulan)` terhadap tanggal sistem saat ini untuk menentukan status **`AKTIF`** atau **`MATI / KEDALUWARSA`**.
+
+---
+
+## Arsitektur Pipeline (11 Tahap Terintegrasi)
+
+| Tahap | Proses | Modul | Keterangan |
+| :---: | :--- | :--- | :--- |
+| 1 | Deteksi & Crop ROI | [`Script/detector.py`](Script/detector.py) | YOLOv8s (`imgsz` adaptif `640`/`960`, *auto-threshold*, fallback rotasi `±35°`, `iou=0.45`) |
+| 2 | Koreksi Kemiringan (*Deskewing*) | [`Script/detector.py`](Script/detector.py) | Proyeksi horizontal (`±45°`) + `cv2.warpAffine` |
+| 3 | Warna HSV & Standar Polaritas | [`Script/detector.py`](Script/detector.py) | Klasifikasi Hitam/Putih/Kuning/Merah & standardisasi latar gelap / teks terang |
+| 4 | Grayscale, Upscale & Smoothing | [`Script/preprocessor.py`](Script/preprocessor.py) | Konversi Grayscale, upscale min `160px`, dan Bilateral Filter (`d=5, sigma=35`) |
+| 5 | Conditional CLAHE | [`Script/preprocessor.py`](Script/preprocessor.py) | Analisis histogram (`mean`, `std`); CLAHE aktif jika `std < 45` atau `mean < 45` |
+| 6 | Unsharp Masking | [`Script/preprocessor.py`](Script/preprocessor.py) | Penajaman tepi huruf (`GaussianBlur` + `addWeighted`) & skor ketajaman Laplacian |
+| 7 | Segmentasi Biner | [`Script/binarizer.py`](Script/binarizer.py) | Otsu & Adaptive Thresholding (latar `0`, karakter `255`) |
+| 8 | Perbaikan Morfologi | [`Script/binarizer.py`](Script/binarizer.py) | *Morphological Closing* pada karakter putih (`255`) untuk menyambung celah |
+| 9 | Segmentasi Dual-ROI | [`Script/binarizer.py`](Script/binarizer.py) | Pemisahan `roi_cleaned` (Connected Components) dan `tax_roi_binary` / `tax_roi_gray` |
+| 10 | Multi-Input OCR & Validasi Pajak | [`Script/recognizer.py`](Script/recognizer.py) | Voting 3+ kandidat (`Otsu`, `Adaptive`, `Sharp`, `StretchCLAHE`), koreksi posisional, & `recognize_tax()` |
+| 11 | Visualisasi Studio Split-Pane | [`Script/utils.py`](Script/utils.py), [`app.py`](app.py) | Antarmuka Streamlit Dark Precision Studio, KPI strip, replika pelat, tabel voting OCR, & grid evaluasi 10 tahap |
+
+---
+
+## Struktur Direktori
+
 ```text
-Indonesian License Plate Detection/
-│
-├── Dataset/
-│   ├── data.yaml                                  # Konfigurasi data training YOLO
-│   └── Raw/                                       # Target download dataset via Kaggle API (diabaikan git)
-│       ├── Indonesian License Plate Dataset/
-│       └── Indonesian License Plate Recognition Dataset/
-│
-├── Script/                                        # Modul inti pemrosesan citra
+ALPR/
+├── .streamlit/
+│   └── config.toml                # Konfigurasi tema Dark Precision Streamlit
+├── Script/
 │   ├── __init__.py
-│   ├── download_dataset.py                        # Script download otomatis via Kaggle API (kagglehub)
-│   ├── detector.py                                # P21: Deteksi plat, deskewing, warna HSV & polaritas
-│   ├── plate_tax_pipeline.py                      # Pipeline Dual-ROI nomor plat & angka pajak (MM-YY)
-│   ├── preprocessor.py                            # P4: Grayscale & P6: CLAHE
-│   ├── binarizer.py                               # P12: Binarisasi (Adaptive/Otsu Threshold)
-│   ├── recognizer.py                              # EasyOCR & Validasi Pola Plat
-│   ├── char_recognizer.py                         # Segmentasi & pengenalan karakter per karakter
-│   └── utils.py                                   # Visualisasi garis penunjuk & Ground Truth
-│
-├── Output/                                        # Folder ekspor hasil proses bertahap
-│   ├── 01_cropped_plates/
-│   ├── 02_preprocessed/
-│   ├── 03_binarized/
-│   └── 04_final_detections/
-│
+│   ├── detector.py                # Tahap 1-3: YOLOv8s auto-threshold, deskewing, HSV & polaritas
+│   ├── preprocessor.py            # Tahap 4-6: Grayscale, upscale, Bilateral, CLAHE, Unsharp Masking
+│   ├── binarizer.py               # Tahap 7-9: Otsu/Adaptive, Morph Closing, Dual-ROI Utama & Pajak
+│   ├── recognizer.py              # Tahap 10 : Multi-input OCR voting, koreksi posisional & status pajak
+│   ├── plate_tax_pipeline.py      # Pipeline referensi evaluasi batch nomor plat & pajak
+│   └── utils.py                   # Tahap 11 : Anotasi bounding box, badge status & ground truth lookup
 ├── models/
-│   └── best.pt                                    # Bobot terlatih YOLOv8 deteksi plat nomor (mAP@0.5: 97.2%)
-├── app.py                                         # Aplikasi antarmuka Web berbasis Streamlit
-├── evaluate_plate_tax.py                          # Skrip evaluasi metrik batch nomor plat & angka pajak
-├── test_single_image.py                           # Skrip uji cepat satu gambar via terminal / path
-├── requirements.txt                               # Dependensi pustaka Python
-├── run_pipeline.ipynb                             # Notebook pipeline utama
-└── run_on_colab.ipynb                             # Notebook untuk eksekusi lengkap via Colab / Kaggle API
+│   └── best.pt                    # Bobot YOLOv8s terlatih (imgsz=960)
+├── app.py                         # Aplikasi Web Streamlit (Split-Pane Inspector & 10-Stage PCD Grid)
+├── evaluate_plate_tax.py          # Skrip evaluasi metrik batch pada dataset Kaggle
+├── requirements.txt               # Dependensi Python
+└── README.md
 ```
 
 ---
 
-## 📥 Pengunduhan Dataset (Kaggle API)
-Proyek menggunakan dataset publik dari Kaggle: [Indonesian License Plate Dataset](https://www.kaggle.com/datasets/juanthomaswijaya/indonesian-license-plate-dataset).
+## Hasil Evaluasi (Dataset Kaggle `juanthomaswijaya/indonesian-license-plate-dataset`)
 
-Untuk mengunduh dataset secara otomatis ke folder lokal `Dataset/Raw/`:
-```bash
-python Script/download_dataset.py
-```
-*Catatan: Pastikan token API Kaggle (`kaggle.json`) sudah ada di `~/.kaggle/` atau telah diset via environment variable.*
+- **Deteksi Pelat YOLOv8s (`test` split, 100 gambar / 197 pelat):**
+  - Precision: `93.71%`
+  - Recall: `98.37%`
+  - mAP@0.5: `97.87%`
+  - mAP@0.5:0.95: `65.06%`
+- **Evaluasi Batch OCR (`evaluate_plate_tax.py`, 30 sampel `test`):**
+  - Exact Match Accuracy: `64.00%`
+  - Character Accuracy: `91.10%` (`CER: 8.90%`, `F1-Score: 88.49%`)
+  - Pajak Valid Terbaca: `36.00%`
 
 ---
 
-## 🚀 Cara Menjalankan
+## Cara Menjalankan
 
-### Opsi 1: Menjalankan di Google Colab (GPU A100 / T4)
-1. Buka Google Colab dan upload notebook **`run_on_colab.ipynb`**.
-2. Pilih **Runtime -> Change runtime type -> T4 / A100 GPU**.
-3. Jalankan sel secara berurutan:
-   * **Tahap 1**: Setup environment & pustaka (`kagglehub`, `ultralytics`, `streamlit`).
-   * **Tahap 2**: Download dataset otomatis dari Kaggle API & train YOLOv8.
-   * **Tahap 3 - 6**: Uji coba pipeline pengolahan citra & OCR.
-   * **Tahap 7**: Jalankan Streamlit Web App dengan public URL via LocalTunnel.
-
-### Opsi 2: Menjalankan di Komputer Lokal
-1. Masuk ke direktori folder proyek di terminal / Command Prompt:
-   ```bash
-   cd "path/ke/folder/proyek/Indonesian-License-Plate-Detection-Recognition"
-   ```
-2. Pasang dependencies:
+1. **Pasang dependensi:**
    ```bash
    pip install -r requirements.txt
    ```
-3. Unduh dataset (jika ingin melakukan training / evaluasi ground truth lokal):
-   ```bash
-   python Script/download_dataset.py
-   ```
-4. Pastikan file bobot `best.pt` sudah tersedia di dalam folder `models/` (bisa diunduh dari hasil training Colab).
-5. Jalankan aplikasi Streamlit:
+2. **Jalankan antarmuka Streamlit:**
    ```bash
    streamlit run app.py
    ```
-6. Buka browser pada alamat `http://localhost:8501`.
+   Buka `http://localhost:8501` di browser.
+3. **Evaluasi batch pada dataset Kaggle (opsional):**
+   ```bash
+   python evaluate_plate_tax.py --split test --max-samples 30 --no-gpu
+   ```
+4. **Uji modul secara mandiri:**
+   ```bash
+   python Script/detector.py path/ke/gambar.jpg
+   python Script/preprocessor.py path/ke/crop_plat.jpg
+   python Script/binarizer.py path/ke/crop_plat.jpg
+   python Script/recognizer.py
+   ```
