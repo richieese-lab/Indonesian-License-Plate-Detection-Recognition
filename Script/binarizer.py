@@ -1,137 +1,170 @@
+import sys
 import cv2
 import numpy as np
 
+
 class PlateBinarizer:
     """
-    Modul Segmentasi Karakter Plat Nomor.
-    Materi yang diterapkan:
-    - P8  : Unsharp Masking (mempertajam tepi karakter setelah upscale)
-    - P12 : Segmentasi Dasar (Otsu & Adaptive Thresholding)
-    - P13-P14 : Morfologi Citra (Closing untuk menyambung karakter yang terputus
-                oleh objek tipis seperti kabel/tali, serta pembersihan komponen noise)
-
-    Menghasilkan beberapa varian citra biner agar OCR dapat melakukan voting.
+    Modul Segmentasi Biner, Morfologi & Dual-ROI (Tahap 7-9).
+    Input: `sharpened` (Grayscale dengan latar gelap & tulisan terang).
+    Standar polaritas biner: Latar Hitam (0) & Karakter Putih (255).
     """
-    def __init__(self, method="otsu", block_size=31, c_val=8):
+
+    def __init__(self, method="otsu", block_size=31, c_val=-6):
         self.method = method
         self.block_size = block_size
         self.c_val = c_val
 
-    # ------------------------------------------------------------------
-    def extract_main_row_roi(self, gray_img):
-        """
-        Memotong tepi bingkai luar plat. Bagian bawah hanya dipotong sedikit (8%)
-        agar bawah angka/huruf tidak terpotong. Angka pajak kecil dibuang kemudian
-        lewat filter tinggi komponen (clean_components).
-        """
-        h, w = gray_img.shape[:2]
-        if h > 25 and w > 60:
-            y1 = int(h * 0.03)
-            y2 = int(h * 0.92)
-            x1 = int(w * 0.02)
-            x2 = int(w * 0.98)
-            roi = gray_img[y1:y2, x1:x2]
-            if roi.size > 0:
-                return roi
-        return gray_img
-
-    def upscale_if_small(self, gray_img, target_height=140):
-        h, w = gray_img.shape[:2]
-        if 0 < h < target_height:
-            scale = target_height / float(h)
-            return cv2.resize(gray_img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
-        return gray_img
-
-    def sharpen(self, gray_img):
-        """Materi P8: Unsharp Masking."""
-        blur = cv2.GaussianBlur(gray_img, (0, 0), 2.0)
-        return cv2.addWeighted(gray_img, 1.6, blur, -0.6, 0)
-
-    # ------------------------------------------------------------------
     def _threshold(self, gray_img, mode):
+        """Tahap 7: Segmentasi Biner (Otsu / Adaptive) berstandar latar 0 & teks 255."""
         if mode == "adaptive":
             b = self.block_size if self.block_size % 2 else self.block_size + 1
-            return cv2.adaptiveThreshold(gray_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                         cv2.THRESH_BINARY, b, self.c_val)
-        _, binary = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            binary = cv2.adaptiveThreshold(
+                gray_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, b, self.c_val,
+            )
+        else:
+            _, binary = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Pastikan piksel latar (mayoritas) bernilai 0 dan karakter bernilai 255
+        if np.count_nonzero(binary) > binary.size * 0.55:
+            binary = cv2.bitwise_not(binary)
         return binary
 
-    def _normalize_polarity(self, binary):
-        """Pastikan latar putih (255) dan karakter hitam (0)."""
-        if np.sum(binary == 255) / float(binary.size) < 0.5:
-            return cv2.bitwise_not(binary)
-        return binary.copy()
-
-    def _close_gaps(self, norm):
-        """Materi P13-P14: Closing pada mask karakter untuk menyambung celah (mis. tali di atas angka)."""
-        h = norm.shape[0]
-        k = max(3, (h // 28) | 1)
+    def _close_gaps(self, binary_raw):
+        """Tahap 8: Morphological Closing pada karakter putih (255) untuk menyambung celah."""
+        h = binary_raw.shape[0]
+        k = max(3, (h // 32) | 1)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-        char_mask = cv2.bitwise_not(norm)
-        closed = cv2.morphologyEx(char_mask, cv2.MORPH_CLOSE, kernel)
-        return cv2.bitwise_not(closed)
+        return cv2.morphologyEx(binary_raw, cv2.MORPH_CLOSE, kernel)
 
-    def clean_components(self, norm):
+    def _clean_main_components(self, morphed_bin):
         """
-        Hapus komponen yang bukan karakter utama:
-        - terlalu lebar (garis bingkai), terlalu kecil (bintik/baut),
-        - terlalu pendek dibanding karakter tertinggi (angka pajak kecil di bawah plat).
+        Ekstrak ROI Nomor Utama (Tahap 9a): hapus bingkai luar, bintik noise,
+        dan angka pajak kecil di baris bawah menggunakan Connected Components.
         """
-        cleaned = norm.copy()
+        cleaned = morphed_bin.copy()
         h, w = cleaned.shape[:2]
-        char_mask = cv2.bitwise_not(cleaned)
-        n, labels, stats, _ = cv2.connectedComponentsWithStats(char_mask, connectivity=8)
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(cleaned, connectivity=8)
         if n <= 1:
-            return cleaned
+            return self._pad(cleaned, value=0), 0
 
-        min_area = max(20, int(h * w * 0.0015))
-        candidates = [stats[i][3] for i in range(1, n)
-                      if stats[i][4] >= min_area and stats[i][2] <= 0.5 * w]
-        max_ch = max(candidates) if candidates else h
+        min_area = max(18, int(h * w * 0.0012))
+        candidates = [
+            stats[i][3] for i in range(1, n)
+            if stats[i][4] >= min_area and stats[i][2] <= 0.5 * w and stats[i][1] < 0.72 * h
+        ]
+        max_ch = max(candidates) if candidates else int(h * 0.55)
 
+        removed = 0
         for i in range(1, n):
             x, y, cw, ch, area = stats[i]
-            if cw > 0.5 * w or area < min_area or ch < 0.5 * max_ch:
-                cleaned[labels == i] = 255
-        return cleaned
+            is_border_line = cw > 0.55 * w or ch > 0.90 * h
+            is_noise = area < min_area
+            is_tax_row = (ch < 0.48 * max_ch) or (y > 0.70 * h and ch < 0.65 * max_ch)
+            if is_border_line or is_noise or is_tax_row:
+                cleaned[labels == i] = 0
+                removed += 1
 
-    def _pad(self, img, value=255):
-        return cv2.copyMakeBorder(img, 15, 15, 20, 20, cv2.BORDER_CONSTANT, value=value)
+        return self._pad(cleaned, value=0), removed
 
-    def _build_variant(self, gray, mode):
-        b = self._threshold(gray, mode)
-        b = self._normalize_polarity(b)
-        b = self._close_gaps(b)
-        b = self.clean_components(b)
-        return self._pad(b)
+    def _extract_tax_roi(self, sharpened_gray):
+        """
+        Ekstrak ROI Angka Pajak MM.YY di bagian tengah-bawah pelat (Tahap 9b):
+        y: 62%-93% tinggi, x: 22%-78% lebar agar tidak membawa teks dudukan pelat.
+        """
+        h, w = sharpened_gray.shape[:2]
+        y1, y2 = int(h * 0.62), int(h * 0.93)
+        x1, x2 = int(w * 0.22), int(w * 0.78)
+        crop_gray = sharpened_gray[y1:y2, x1:x2]
+        if crop_gray.size == 0:
+            crop_gray = sharpened_gray
 
-    # ------------------------------------------------------------------
-    def process(self, enhanced_gray):
-        roi = self.extract_main_row_roi(enhanced_gray)
-        upscaled = self.upscale_if_small(roi)
-        sharp = self.sharpen(upscaled)
+        tax_gray = cv2.resize(
+            crop_gray,
+            (max(1, crop_gray.shape[1] * 2), max(1, crop_gray.shape[0] * 2)),
+            interpolation=cv2.INTER_CUBIC,
+        )
+        _, tax_bin = cv2.threshold(tax_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        if np.count_nonzero(tax_bin) > tax_bin.size * 0.55:
+            tax_bin = cv2.bitwise_not(tax_bin)
+
+        # Bersihkan noise mikro pada ROI pajak
+        th, tw = tax_bin.shape[:2]
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(tax_bin, connectivity=8)
+        min_tax_area = max(10, int(th * tw * 0.002))
+        for i in range(1, n):
+            if stats[i][4] < min_tax_area or stats[i][2] > 0.65 * tw:
+                tax_bin[labels == i] = 0
+
+        return self._pad(tax_bin, value=0), self._pad(tax_gray, value=0)
+
+    def separate_main_and_tax_roi(self, morphed_bin, sharpened_gray):
+        """Tahap 9: Pisahkan ROI Nomor Utama dan ROI Nomor Pajak."""
+        roi_cleaned, removed_blobs = self._clean_main_components(morphed_bin)
+        tax_roi_binary, tax_roi_gray = self._extract_tax_roi(sharpened_gray)
+        return roi_cleaned, removed_blobs, tax_roi_binary, tax_roi_gray
+
+    @staticmethod
+    def _pad(img, value=0):
+        return cv2.copyMakeBorder(img, 14, 14, 18, 18, cv2.BORDER_CONSTANT, value=value)
+
+    def process(self, sharpened_gray):
+        """
+        Alur lengkap Tahap 7-9:
+        Crop ROI Utama (4%-74% tinggi) -> Thresholding -> Morphological Closing -> Dual-ROI (Utama & Pajak).
+        """
+        if sharpened_gray is None or sharpened_gray.size == 0:
+            raise ValueError("Citra sharpened grayscale kosong!")
+
+        h, w = sharpened_gray.shape[:2]
+        main_gray = sharpened_gray[int(h * 0.04):int(h * 0.74), int(w * 0.03):int(w * 0.97)]
+        if main_gray.size == 0:
+            main_gray = sharpened_gray
 
         primary_mode = "adaptive" if self.method == "adaptive" else "otsu"
         secondary_mode = "otsu" if primary_mode == "adaptive" else "adaptive"
 
-        binary_primary = self._build_variant(sharp, primary_mode)
-        binary_secondary = self._build_variant(sharp, secondary_mode)
+        binary_raw = self._threshold(main_gray, primary_mode)
+        morphed = self._close_gaps(binary_raw)
+        roi_cleaned, removed_blobs = self._clean_main_components(morphed)
+        tax_roi_binary, tax_roi_gray = self._extract_tax_roi(sharpened_gray)
 
-        sharp_padded = cv2.copyMakeBorder(sharp, 15, 15, 20, 20, cv2.BORDER_REPLICATE)
+        # Kandidat sekunder (Adaptive ROI & StretchCLAHE) untuk voting OCR akurat
+        sec_raw = self._threshold(main_gray, secondary_mode)
+        sec_morphed = self._close_gaps(sec_raw)
+        sec_roi, _ = self._clean_main_components(sec_morphed)
+
+        stretched = cv2.normalize(main_gray, None, 0, 255, cv2.NORM_MINMAX)
+        stretch_clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(stretched)
+        stretch_padded = cv2.copyMakeBorder(stretch_clahe, 14, 14, 18, 18, cv2.BORDER_REPLICATE)
+        sharp_padded = cv2.copyMakeBorder(main_gray, 14, 14, 18, 18, cv2.BORDER_REPLICATE)
+
+        white_ratio = round(float(np.count_nonzero(roi_cleaned) / max(1, roi_cleaned.size)), 3)
 
         return {
             "upscaled_gray": sharp_padded,
-            "binary_raw": binary_primary,
-            "binary_normalized": binary_primary,
-            "variants": [binary_secondary, sharp_padded]
+            "binary_raw": binary_raw,
+            "morphed": morphed,
+            "binary_normalized": roi_cleaned,
+            "roi_cleaned": roi_cleaned,
+            "removed_blobs": removed_blobs,
+            "white_ratio": white_ratio,
+            "tax_roi_binary": tax_roi_binary,
+            "tax_roi_gray": tax_roi_gray,
+            "variants": [sec_roi, stretch_padded],
         }
 
+
 if __name__ == "__main__":
-    import os
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    test_img = os.path.join(base_dir, "Dataset", "Raw", "Indonesian License Plate Dataset", "images", "test", "test001.jpg")
-    if os.path.exists(test_img):
-        img = cv2.imread(test_img, cv2.IMREAD_GRAYSCALE)
-        res = PlateBinarizer().process(img)
-        print("Binarisasi sukses! Ukuran biner:", res["binary_normalized"].shape)
-    input("\nTekan Enter untuk menutup jendela ini...")
+    if len(sys.argv) < 2:
+        print("Penggunaan: python Script/binarizer.py <path_gambar_plat>")
+        sys.exit(0)
+    from Script.preprocessor import PlatePreprocessor
+    img = cv2.imread(sys.argv[1])
+    if img is None:
+        print(f"Gagal membaca gambar: {sys.argv[1]}")
+        sys.exit(1)
+    pre = PlatePreprocessor().process(img)
+    res = PlateBinarizer().process(pre["sharpened"])
+    print(f"Binarisasi sukses | roi={res['roi_cleaned'].shape} | removed={res['removed_blobs']} | white={res['white_ratio']}")

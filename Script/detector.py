@@ -16,7 +16,7 @@ from ultralytics import YOLO
 # Catatan nilai HSV di OpenCV: H = 0-179 (bukan 0-360), S dan V = 0-255.
 # ======================================================================
 
-MAX_SKEW_DEG = 25.0     # kemiringan di atas ini tidak dikoreksi, takut gambarnya malah rusak
+MAX_SKEW_DEG = 45.0     # kemiringan di atas ini tidak dikoreksi, takut gambarnya malah rusak
 MIN_SKEW_DEG = 0.5      # di bawah ini plat dianggap sudah lurus
 MIN_SKEW_GAIN = 1.05    # rotasi harus menaikkan skor profil minimal 5%, kalau tidak berarti cuma noise
 
@@ -157,7 +157,8 @@ class PlateDetector:
     Alur per plat: YOLO -> crop -> deskew -> warna plat (HSV) -> standar polaritas.
     Rasio aspek dipakai untuk menandai plat yang terhalang / tidak utuh.
     """
-    def __init__(self, model_path=None, conf_threshold=0.35):
+    def __init__(self, model_path=None, conf_threshold=None):
+        # None = mode otomatis (kalibrasi ambang adaptif di detect())
         self.conf_threshold = conf_threshold
 
         # Urutan pencarian bobot: models/best.pt -> models/license_plate_detector.pt -> yolov8n.pt
@@ -304,25 +305,87 @@ class PlateDetector:
         }
 
     @staticmethod
-    def check_aspect_ratio(w, h):
+    def check_aspect_ratio(w, h, box=None, img_shape=None):
         """
-        Rasio panjang:tinggi plat Indonesia sekitar 2.0 - 4.5.
-        Terlalu kecil (< 1.8) biasanya platnya terpotong / terhalang,
+        Rasio panjang:tinggi plat Indonesia sekitar 2.0 - 4.5 (mobil) dan 1.45 - 2.5 (motor dari sudut miring).
+        Terlalu kecil (< 1.38) atau terpotong di tepi gambar berarti plat terhalang / tidak utuh,
         terlalu besar (> 5.5) biasanya salah deteksi.
         """
         aspect_ratio = float(w) / float(h)
-        if aspect_ratio < 1.8:
+        if aspect_ratio < 1.38:
             return aspect_ratio, False, "Terhalang / Tidak Utuh (Rasio Terlalu Kecil)"
         if aspect_ratio > 5.5:
             return aspect_ratio, False, "Tidak Wajar (Rasio Terlalu Panjang)"
+        if box is not None and img_shape is not None:
+            x1, y1, x2, y2 = box
+            img_h, img_w = img_shape[:2]
+            touches_edge = (x1 <= 2 or y1 <= 2 or x2 >= img_w - 2 or y2 >= img_h - 2)
+            if touches_edge and aspect_ratio < 1.75:
+                return aspect_ratio, False, "Terhalang / Terpotong Tepi Gambar"
         return aspect_ratio, True, "Lengkap"
+
+    @staticmethod
+    def _has_plate_texture(crop_bgr):
+        """
+        Verifikasi ringan untuk kandidat berkeyakinan sedang: memastikan crop memiliki
+        kepadatan tepi/kontras karakter pelat, bukan area polos (bodi/aspal/bayangan).
+        """
+        if crop_bgr is None or crop_bgr.size == 0:
+            return False
+        gray = _to_gray(crop_bgr)
+        h, w = gray.shape[:2]
+        if h < 10 or w < 14:
+            return False
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        edge_energy = float(np.mean(np.abs(gx)))
+        std_val = float(np.std(gray))
+        return edge_energy >= 12.0 and std_val >= 22.0
+
+    def _run_yolo_pass(self, image, infer_conf, infer_imgsz):
+        results = self.model(
+            image,
+            conf=infer_conf,
+            iou=0.45,
+            imgsz=infer_imgsz,
+            verbose=False,
+        )
+        boxes = []
+        for r in results:
+            for box in r.boxes:
+                x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].cpu().numpy()]
+                conf = float(box.conf[0].cpu().numpy())
+                cls_id = int(box.cls[0].cpu().numpy())
+                boxes.append((x1, y1, x2, y2, conf, cls_id))
+        return boxes
+
+    def _detect_tilted_fallback(self, image, infer_conf, infer_imgsz):
+        """Fallback untuk foto dengan pelat miring ekstrem (30-45 derajat)."""
+        img_h, img_w = image.shape[:2]
+        center = (img_w / 2.0, img_h / 2.0)
+        mapped = []
+        for ang in (35.0, -35.0):
+            M = cv2.getRotationMatrix2D(center, ang, 1.0)
+            rot = cv2.warpAffine(image, M, (img_w, img_h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+            raw_boxes = self._run_yolo_pass(rot, max(0.20, infer_conf), infer_imgsz)
+            if not raw_boxes:
+                continue
+            M_inv = cv2.invertAffineTransform(M)
+            for rx1, ry1, rx2, ry2, conf, cls_id in raw_boxes:
+                corners = np.array([[rx1, ry1, 1], [rx2, ry1, 1], [rx2, ry2, 1], [rx1, ry2, 1]], dtype=np.float32)
+                orig_pts = (M_inv @ corners.T).T
+                ox1, oy1 = int(np.min(orig_pts[:, 0])), int(np.min(orig_pts[:, 1]))
+                ox2, oy2 = int(np.max(orig_pts[:, 0])), int(np.max(orig_pts[:, 1]))
+                mapped.append((ox1, oy1, ox2, oy2, conf, cls_id))
+            if mapped:
+                break
+        return mapped
 
     # ------------------------------------------------------------------
     # Tahap 1: Deteksi & crop
     # ------------------------------------------------------------------
     def detect(self, image_input):
         """
-        Mendeteksi plat nomor dari gambar.
+        Mendeteksi plat nomor dari gambar dengan ambang deteksi otomatis.
         Input : path file (str) atau numpy.ndarray BGR
         Output: list of dict, key-nya lihat daftar di bagian atas file.
         """
@@ -334,38 +397,70 @@ class PlateDetector:
             image = image_input.copy()
 
         img_h, img_w = image.shape[:2]
-        results = self.model(image, conf=self.conf_threshold, verbose=False)
+        auto_mode = self.conf_threshold is None
+        infer_conf = 0.18 if auto_mode else float(self.conf_threshold)
+        if self.is_plate_model:
+            infer_imgsz = 640 if max(img_h, img_w) <= 720 else 960
+        else:
+            infer_imgsz = 640
+
+        raw_boxes = self._run_yolo_pass(image, infer_conf, infer_imgsz)
+        if not raw_boxes and self.is_plate_model:
+            raw_boxes = self._detect_tilted_fallback(image, infer_conf, infer_imgsz)
 
         detections = []
-        for r in results:
-            for box in r.boxes:
-                x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].cpu().numpy()]
-                conf = float(box.conf[0].cpu().numpy())
-                cls_id = int(box.cls[0].cpu().numpy())
+        for x1, y1, x2, y2, conf, cls_id in raw_boxes:
+            # jaga supaya koordinat tidak keluar dari ukuran gambar
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(img_w, x2), min(img_h, y2)
+            w, h = x2 - x1, y2 - y1
+            if w <= 14 or h <= 10:
+                continue
 
-                # jaga supaya koordinat tidak keluar dari ukuran gambar
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(img_w, x2), min(img_h, y2)
-                w, h = x2 - x1, y2 - y1
-                if w <= 10 or h <= 10:
+            raw_ar = float(w) / float(h)
+            # Pelat yang miring 30-45 derajat memiliki bounding box hampir persegi (ar ~ 0.65 - 1.35)
+            if raw_ar < 0.65 or raw_ar > 6.0:
+                continue
+
+            crop_img = image[y1:y2, x1:x2]
+
+            # Filter otomatis untuk kandidat berkeyakinan sedang (0.18 - 0.32):
+            # hanya lolos jika rasio wajar & memiliki tekstur tepi karakter pelat.
+            if auto_mode and conf < 0.32:
+                if not (0.70 <= raw_ar <= 5.0 and self._has_plate_texture(crop_img)):
                     continue
 
-                aspect_ratio, is_complete, status_desc = self.check_aspect_ratio(w, h)
-                crop_img = image[y1:y2, x1:x2]
+            processed = self.process_crop(crop_img)
+            # Hitung aspek rasio: untuk pelat miring (>= 15 deg), kotak axis-aligned tampak persegi,
+            # jadi evaluasi keutuhan mempertimbangkan kemiringan agar pelat miring utuh tidak dianggap terhalang.
+            dw, dh = processed["deskewed"].shape[1], processed["deskewed"].shape[0]
+            if abs(processed["skew_angle"]) >= 5.0 and dw > 0 and dh > 0:
+                check_w, check_h = dw, dh
+            else:
+                check_w, check_h = w, h
 
-                det = {
-                    "box": (x1, y1, x2, y2),
-                    "confidence": conf,
-                    "class_id": cls_id,
-                    "crop": crop_img,
-                }
-                det.update(self.process_crop(crop_img))
-                det.update({
-                    "aspect_ratio": round(aspect_ratio, 2),
-                    "is_complete": is_complete,
-                    "status": status_desc,
-                })
-                detections.append(det)
+            aspect_ratio, is_complete, status_desc = self.check_aspect_ratio(
+                check_w, check_h, box=(x1, y1, x2, y2), img_shape=(img_h, img_w)
+            )
+            if not is_complete and abs(processed["skew_angle"]) >= 15.0:
+                touches_edge = (x1 <= 2 or y1 <= 2 or x2 >= img_w - 2 or y2 >= img_h - 2)
+                if not touches_edge and raw_ar >= 0.65:
+                    is_complete = True
+                    status_desc = f"Lengkap (Miring {processed['skew_angle']:+.1f} deg)"
+
+            det = {
+                "box": (x1, y1, x2, y2),
+                "confidence": conf,
+                "class_id": cls_id,
+                "crop": crop_img,
+            }
+            det.update(processed)
+            det.update({
+                "aspect_ratio": round(aspect_ratio, 2),
+                "is_complete": is_complete,
+                "status": status_desc,
+            })
+            detections.append(det)
 
         return detections
 
@@ -391,45 +486,17 @@ def _crops_from_labels(img_path, label_path):
 
 
 if __name__ == "__main__":
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    data_dir = os.path.join(base_dir, "Dataset", "Raw", "Indonesian License Plate Dataset")
-    out_dir = os.path.join(base_dir, "Output", "01_cropped_plates")
-    os.makedirs(out_dir, exist_ok=True)
-
-    test_imgs = sys.argv[1:] or sorted(glob.glob(os.path.join(data_dir, "images", "test", "*.jpg")))[:5]
-    if not test_imgs:
-        print("Tidak ada gambar uji. Jalankan: python Script/detector.py path/ke/gambar.jpg")
+    if len(sys.argv) < 2:
+        print("Penggunaan: python Script/detector.py <path_gambar ...>")
         sys.exit(0)
 
     detector = PlateDetector()
-
-    for img_path in test_imgs:
-        name = os.path.splitext(os.path.basename(img_path))[0]
-        label_path = os.path.join(data_dir, "labelswithLP", "test", name + ".txt")
+    for img_path in sys.argv[1:]:
         print(f"\n=== {img_path}")
-
-        if detector.is_plate_model:
-            items = [(d["box"], d, None) for d in detector.detect(img_path)]
-        elif os.path.exists(label_path):
-            # best.pt belum ada: kotak plat diambil dari label dataset, tahap 2-3 tetap bisa diuji
-            print("    (mode label: kotak plat diambil dari file label, bukan dari YOLO)")
-            items = []
-            for box, crop, gt in _crops_from_labels(img_path, label_path):
-                d = {"box": box, "crop": crop}
-                d.update(detector.process_crop(crop))
-                items.append((box, d, gt))
-        else:
-            print("    Lewati: best.pt belum ada dan gambar ini tidak punya file label.")
-            continue
-
+        items = detector.detect(img_path)
         print(f"    Jumlah plat: {len(items)}")
-        for i, (box, d, gt) in enumerate(items, start=1):
-            print(f"    Plat #{i}{(' (' + gt + ')') if gt else ''} box={box}")
+        for i, d in enumerate(items, start=1):
+            print(f"    Plat #{i} box={d['box']} conf={d['confidence']:.2f} | {d['status']}")
             print(f"      Deskew   : {d['deskew_status']}")
             print(f"      Warna    : {d['plate_color']} -> {d['vehicle_type']}")
-            print(f"      HSV      : {d['hsv_summary']}")
             print(f"      Polaritas: {d['polarity_status']}")
-            for key in ("crop", "deskewed", "polarity_std"):
-                cv2.imwrite(os.path.join(out_dir, f"{name}_{i}_{key}.jpg"), d[key])
-
-    print(f"\nHasil crop, deskewed, dan polarity_std disimpan di: {out_dir}")
