@@ -10,6 +10,7 @@ from ultralytics import YOLO
 #
 # Key yang dikembalikan untuk setiap plat (sesuai kontrak data tim):
 #   box, confidence, class_id, crop, deskewed, skew_angle, deskew_status,
+#   trim_box, trim_status,
 #   plate_color, vehicle_type, hsv_summary, polarity_std, is_inverted,
 #   polarity_status, aspect_ratio, is_complete, status
 #
@@ -148,6 +149,176 @@ def _plate_stats(plate_bgr):
     }
 
 
+# ----------------------------------------------------------------------
+# Pemangkasan pinggiran non-plat (setelah deskew)
+# ----------------------------------------------------------------------
+TRIM_ROW_THR = 0.30     # baris dengan latar plat < 30% dianggap garis bingkai / bukan plat
+TRIM_COL_THR = 0.22     # sama untuk kolom (lebih rendah karena goresan huruf tegak juga mengurangi latar)
+
+
+def _plate_bg_mask(gray):
+    """
+    Mask latar plat. Ambang Otsu dihitung dari bagian tengah plat saja (pasti isinya plat),
+    lalu kelompok yang paling banyak di tengah itu dianggap warna latar.
+    Return: (mask_latar, latar_terang)
+    """
+    h, w = gray.shape
+    seed = gray[int(h * .25):int(h * .75), int(w * .2):int(w * .8)]
+    t, sb = cv2.threshold(seed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    bright_bg = (sb > 0).mean() >= 0.5
+    return ((gray > t) if bright_bg else (gray <= t)), bright_bg
+
+
+def _main_text_box(text_mask):
+    """
+    Kotak gabungan huruf nomor utama dari connected component tulisan.
+    Dipakai sebagai jangkar: pemangkasan tidak boleh melewati kotak ini.
+    Return (x1, y1, x2, y2, tinggi_huruf) atau None kalau hurufnya tidak jelas.
+    """
+    h, w = text_mask.shape
+    n, _, st, _ = cv2.connectedComponentsWithStats(text_mask.astype(np.uint8), 8)
+    chars = [tuple(st[i][:4]) for i in range(1, n)
+             if 0.28 * h <= st[i][3] <= 0.85 * h and 0.02 * w <= st[i][2] <= 0.22 * w
+             and st[i][4] >= 0.15 * st[i][2] * st[i][3]]
+    if len(chars) < 3:
+        return None
+    # huruf nomor utama tingginya hampir sama, jadi buang yang jauh dari median tinggi
+    mh = float(np.median([c[3] for c in chars]))
+    chars = [c for c in chars if 0.7 * mh <= c[3] <= 1.3 * mh]
+    if len(chars) < 3:
+        return None
+    x1 = min(c[0] for c in chars)
+    x2 = max(c[0] + c[2] for c in chars)
+    y1 = int(np.median([c[1] for c in chars]))
+    y2 = int(np.median([c[1] + c[3] for c in chars]))
+    return x1, y1, x2, y2, mh
+
+
+def _scan_until_border(profile, start, step, thr, run=1):
+    """Jalan dari `start` ke arah `step` sampai ketemu `run` indeks berturut-turut di bawah `thr`."""
+    i, cnt = start, 0
+    while 0 <= i < len(profile):
+        cnt = cnt + 1 if profile[i] < thr else 0
+        if cnt >= run:
+            return i - step * (run - 1)
+        i += step
+    return None
+
+
+def _ink_mask(gray, bright_bg):
+    """
+    Mask tulisan/garis dengan ambang adaptif (rata-rata lokal). Garis bingkai plat sering
+    tipis dan agak kabur, jadi dengan Otsu global sebagian pikselnya ikut masuk latar.
+    """
+    blk = max(11, (gray.shape[0] // 3) | 1)
+    if bright_bg:
+        return cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, blk, 5)
+    return cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, blk, -5)
+
+
+def _long_lines(ink, length, horizontal):
+    """
+    Opening morfologi (P13-14) dengan elemen struktur berupa garis panjang: semua yang lebih
+    pendek dari `length` (huruf, angka, noise) hilang, yang tersisa hanya garis bingkai.
+    Sebelumnya mask ditebalkan sedikit supaya garis yang agak miring tidak putus.
+    """
+    if horizontal:
+        pre = cv2.dilate(ink, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3)))
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, int(length)), 1))
+    else:
+        pre = cv2.dilate(ink, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1)))
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, int(length))))
+    return cv2.morphologyEx(pre, cv2.MORPH_OPEN, k)
+
+
+def _has_char_between(ink, ty1, ty2, xa, xb, char_h):
+    """Cek apakah di antara garis tegak dan kotak huruf masih ada huruf (huruf pertama/terakhir yang tidak ikut terdeteksi)."""
+    if xb - xa < 2:
+        return False
+    n, _, st, _ = cv2.connectedComponentsWithStats((ink[ty1:ty2, xa:xb] > 0).astype(np.uint8), 8)
+    return any(st[i][3] >= 0.5 * char_h and st[i][4] >= 0.1 * char_h * char_h for i in range(1, n))
+
+
+def trim_plate_margins(plate_bgr):
+    """
+    Buang pinggiran yang bukan plat (bingkai dudukan plat, bodi mobil) dari plat yang sudah lurus.
+
+    Cara kerja (integral proyeksi, P17):
+      1. Pisahkan latar plat dan tulisan (Otsu dari bagian tengah plat).
+      2. Cari kotak huruf nomor utama. Kotak ini jadi titik awal dan batas aman.
+      3. Dari tepi kotak huruf, telusuri profil baris ke atas dan ke bawah, dan profil kolom
+         ke kiri dan ke kanan. Begitu ketemu baris/kolom yang hampir tidak berisi latar plat
+         (garis bingkai), di situlah tepi plat.
+         Penelusuran dari dalam ke luar, bukan dari luar ke dalam, karena bodi mobil di luar
+         bingkai bisa saja warnanya sama dengan latar plat (mobil putih, plat putih).
+      4. Ke bawah, titik awalnya digeser melewati baris angka pajak supaya tidak ikut terpotong.
+      5. Garis bingkai tipis dicari juga dengan opening morfologi (P13-14), karena di profil
+         latar garis setipis itu kurang kelihatan.
+    Return: (citra_terpangkas, (y1, y2, x1, x2), status)
+    """
+    gray = _to_gray(plate_bgr)
+    h, w = gray.shape[:2]
+    if h < 16 or w < 40:
+        return plate_bgr, (0, h, 0, w), "Tidak dipangkas (plat terlalu kecil)"
+
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    bg, bright_bg = _plate_bg_mask(blur)
+    box = _main_text_box(~bg)
+    if box is None:
+        return plate_bgr, (0, h, 0, w), "Tidak dipangkas (huruf tidak terdeteksi)"
+    tx1, ty1, tx2, ty2, ch = box
+    bgf = bg.astype(np.float32)
+
+    rows = bgf[:, tx1:tx2].mean(axis=1)
+    top = _scan_until_border(rows, ty1 - max(1, int(0.08 * ch)), -1, TRIM_ROW_THR)
+    tax_end = min(h - 1, int(ty2 + 0.55 * ch))
+    bottom = _scan_until_border(rows, tax_end, +1, TRIM_ROW_THR)
+    y1 = 0 if top is None else top + 1
+    y2 = h if bottom is None else bottom
+
+    # profil kolom diambil di seluruh tinggi plat: garis bingkai tegak memotong semua baris,
+    # sedangkan goresan huruf hanya setinggi huruf, jadi latar di kolom huruf masih sekitar 40%
+    cols = bgf[y1:y2, :].mean(axis=0)
+    mx = max(1, int(0.15 * ch))
+    left = _scan_until_border(cols, tx1 - mx, -1, TRIM_COL_THR, run=2)
+    right = _scan_until_border(cols, tx2 + mx, +1, TRIM_COL_THR, run=2)
+    x1 = 0 if left is None else left + 1
+    x2 = w if right is None else right
+
+    # Garis bingkai yang tipis sering lolos dari profil latar di atas (pikselnya separuh
+    # masuk latar). Garis ini dicari terpisah dengan opening morfologi, lalu batas potong
+    # digeser ke garis terdalam yang masih di luar teks.
+    ink = _ink_mask(blur, bright_bg)
+    hl = _long_lines(ink, 0.45 * (tx2 - tx1), horizontal=True)
+    vl = _long_lines(ink, 1.25 * ch, horizontal=False)
+    row_line = (hl[:, tx1:tx2] > 0).mean(axis=1)
+    col_line = (vl > 0).mean(axis=0)
+    above = [y for y in range(0, max(0, ty1 - 1)) if row_line[y] > 0.3]
+    below = [y for y in range(tax_end, h) if row_line[y] > 0.3]
+    if above:
+        y1 = max(y1, max(above) + 1)
+    if below:
+        y2 = min(y2, min(below))
+    # garis tegak hanya dipakai kalau di antara garis itu dan kotak huruf tidak ada huruf lagi,
+    # karena huruf pertama/terakhir yang menempel bingkai kadang tidak masuk kotak huruf
+    for x in sorted((x for x in range(0, max(0, tx1 - 1)) if col_line[x] > 0), reverse=True):
+        if not _has_char_between(ink, ty1, ty2, x + 1, tx1 - 1, ch):
+            x1 = max(x1, x + 1)
+            break
+    for x in sorted(x for x in range(tx2 + 1, w) if col_line[x] > 0):
+        if not _has_char_between(ink, ty1, ty2, tx2 + 1, x, ch):
+            x2 = min(x2, x)
+            break
+
+    # batas aman: pinggiran non-plat tidak pernah selebar ini, kalau lebih berarti salah baca
+    x1, x2 = min(x1, int(0.15 * w)), max(x2, int(0.85 * w))
+    y1, y2 = min(y1, int(0.30 * h)), max(y2, int(0.70 * h))
+    if (x1, y1, x2, y2) == (0, 0, w, h):
+        return plate_bgr, (0, h, 0, w), "Tidak dipangkas (tidak ada bingkai di luar plat)"
+    status = f"Dipangkas atas {y1}, bawah {h - y2}, kiri {x1}, kanan {w - x2} px"
+    return plate_bgr[y1:y2, x1:x2].copy(), (y1, y2, x1, x2), status
+
+
 # ======================================================================
 # TODO: Modul Deteksi Warna Pelat (HSV) -> Jenis Kendaraan
 # ======================================================================
@@ -280,6 +451,9 @@ class PlateDetector:
     def process_crop(self, crop_bgr):
         """Jalankan tahap 2-3 untuk satu crop plat. Dipakai detect() dan tes mandiri."""
         deskewed, skew_angle, deskew_status = self.deskew_plate(crop_bgr)
+        # setelah lurus, pinggiran bingkai/bodi mobil dibuang supaya tahap berikutnya
+        # (warna, polaritas, binerisasi) hanya melihat plat
+        deskewed, trim_box, trim_status = trim_plate_margins(deskewed)
         color_info = self.classify_plate_color(deskewed)
         polarity_std, is_inverted, polarity_status = self.standardize_polarity(
             deskewed, color_info["plate_color"])
@@ -287,6 +461,8 @@ class PlateDetector:
             "deskewed": deskewed,
             "skew_angle": skew_angle,
             "deskew_status": deskew_status,
+            "trim_box": trim_box,
+            "trim_status": trim_status,
             "plate_color": color_info["plate_color"],
             "vehicle_type": color_info["vehicle_type"],
             "hsv_summary": color_info["hsv_summary"],
