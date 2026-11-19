@@ -177,9 +177,13 @@ def _main_text_box(text_mask):
     """
     h, w = text_mask.shape
     n, _, st, _ = cv2.connectedComponentsWithStats(text_mask.astype(np.uint8), 8)
+    # batas bawah tinggi huruf sengaja longgar (18% tinggi crop): kalau kotak YOLO longgar,
+    # plat cuma menempati sebagian crop sehingga hurufnya terlihat pendek. Stiker pajak yang
+    # berbentuk kotak penuh disaring lewat kepadatan piksel dan bentuknya yang melebar.
     chars = [tuple(st[i][:4]) for i in range(1, n)
-             if 0.28 * h <= st[i][3] <= 0.85 * h and 0.02 * w <= st[i][2] <= 0.22 * w
-             and st[i][4] >= 0.15 * st[i][2] * st[i][3]]
+             if 0.18 * h <= st[i][3] <= 0.85 * h and 0.02 * w <= st[i][2] <= 0.22 * w
+             and 0.15 <= st[i][4] / float(st[i][2] * st[i][3]) <= 0.85
+             and st[i][3] >= 0.9 * st[i][2]]
     if len(chars) < 3:
         return None
     # huruf nomor utama tingginya hampir sama, jadi buang yang jauh dari median tinggi
