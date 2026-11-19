@@ -62,3 +62,6 @@ Output/04_final_detections/*
 .idea/
 .DS_Store
 Thumbs.db
+
+# Hasil notebook evaluasi (dibuat ulang setiap Run All)
+Output/evaluasi/

@@ -409,8 +409,9 @@ else:
                 )
 
             # Jalankan pipeline pengenalan nomor plat & angka pajak
-            ocr_res = analyze_single_plate(deskewed_bgr, ocr_reader, use_vlm=use_vlm)
-            prep_vis = preprocess_plate(deskewed_bgr)
+            # deskewed_bgr sudah diluruskan detector.py, jadi tidak perlu diputar lagi
+            ocr_res = analyze_single_plate(deskewed_bgr, ocr_reader, use_vlm=use_vlm, skip_deskew=True)
+            prep_vis = preprocess_plate(deskewed_bgr, skip_deskew=True)
             main_vars, _ = process_main_plate_roi(
                 prep_vis["enhanced"], prep_vis["yellow_channel"], raw_gray=prep_vis["gray"]
             )

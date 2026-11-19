@@ -144,9 +144,17 @@ def extract_yellow_contrast_channel(bgr_img):
     return _CLAHE.apply(combined)
 
 
-def preprocess_plate(bgr_img):
-    """Alur preprocessing lengkap: Deskew -> Grayscale -> Bilateral -> Smart CLAHE (+ Yellow Channel)."""
-    deskewed_bgr, angle = deskew_img(bgr_img)
+def preprocess_plate(bgr_img, skip_deskew=False):
+    """
+    Alur preprocessing lengkap: Deskew -> Grayscale -> Bilateral -> Smart CLAHE (+ Yellow Channel).
+    skip_deskew=True dipakai kalau citra sudah diluruskan oleh detector.py (di app.py selalu begitu),
+    supaya plat tidak diputar dua kali. Deskew di sini hanya pakai Hough, dan di foto asli
+    sering membatalkan koreksi detector yang sudah benar.
+    """
+    if skip_deskew:
+        deskewed_bgr, angle = bgr_img, 0.0
+    else:
+        deskewed_bgr, angle = deskew_img(bgr_img)
     gray = cv2.cvtColor(deskewed_bgr, cv2.COLOR_BGR2GRAY)
     smoothed = (
         cv2.bilateralFilter(gray, d=5, sigmaColor=35, sigmaSpace=35)
@@ -179,7 +187,25 @@ def normalize_polarity(binary_img):
     return cv2.bitwise_not(binary_img) if white_ratio < 0.5 else binary_img.copy()
 
 
-def _clean_cc(bin_img, max_w_ratio=0.45, min_h_ratio=0.40, min_area_ratio=0.0015, min_area_abs=20):
+FRAME_THIN_RATIO = 0.30   # garis bingkai: lebarnya < 30% tingginya
+FRAME_CORNER_RATIO = 0.60  # potongan sudut bingkai (bentuk "L"): lebar < 60% tinggi + menempel atas/bawah
+
+
+def _is_frame_piece(x, y, cw, ch, nw, nh):
+    """
+    Sisa bingkai plat di kiri/kanan ROI. Cirinya selalu menempel tepi kiri atau kanan ROI,
+    lalu kurus (garis tegak) atau berbentuk sudut "L" yang juga menempel tepi atas/bawah.
+    Kalau dibiarkan, EasyOCR membacanya sebagai "I", "1", atau "L" dan jumlah karakternya jadi lebih.
+    """
+    touches_side = x <= 2 or x + cw >= nw - 2
+    if not touches_side:
+        return False
+    touches_tb = y <= 2 or y + ch >= nh - 2
+    return cw < FRAME_THIN_RATIO * ch or (touches_tb and cw < FRAME_CORNER_RATIO * ch)
+
+
+def _clean_cc(bin_img, max_w_ratio=0.45, min_h_ratio=0.40, min_area_ratio=0.0015, min_area_abs=20,
+              drop_frame=True):
     norm = normalize_polarity(bin_img)
     ch_mask = cv2.bitwise_not(norm)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(ch_mask, connectivity=8)
@@ -187,11 +213,16 @@ def _clean_cc(bin_img, max_w_ratio=0.45, min_h_ratio=0.40, min_area_ratio=0.0015
     nh, nw = norm.shape[:2]
     if n > 1:
         min_a = max(min_area_abs, int(norm.size * min_area_ratio))
-        cands = [stats[i][3] for i in range(1, n) if stats[i][4] >= min_a and stats[i][2] <= max_w_ratio * nw]
+        frame = set()
+        if drop_frame:
+            frame = {i for i in range(1, n) if _is_frame_piece(*stats[i][:4], nw, nh)}
+        # tinggi karakter acuan dihitung tanpa garis bingkai, karena bingkai biasanya paling tinggi
+        cands = [stats[i][3] for i in range(1, n)
+                 if i not in frame and stats[i][4] >= min_a and stats[i][2] <= max_w_ratio * nw]
         max_h = max(cands) if cands else nh
         for i in range(1, n):
             _, _, cw, ch, area = stats[i]
-            if cw > max_w_ratio * nw or area < min_a or ch < min_h_ratio * max_h:
+            if i in frame or cw > max_w_ratio * nw or area < min_a or ch < min_h_ratio * max_h:
                 cleaned[labels == i] = 255
     # Pengaman: jika hampir semua piksel hitam terhapus, kembalikan norm
     if np.sum(cleaned == 0) < 80:
@@ -243,10 +274,94 @@ def process_main_plate_roi(enhanced_gray, yellow_channel=None, raw_gray=None):
     return variants, roi
 
 
+def _edge_row_profile(gray, x1r=0.20, x2r=0.80):
+    """
+    Integral proyeksi horizontal (P17) dari tepi tegak.
+    Tepi diambil dari gradien horizontal (Sobel-x, P8/P12): goresan huruf punya banyak
+    tepi tegak, sedangkan garis bingkai dan bemper yang mendatar hampir tidak punya
+    gradien-x. Jadi profil ini hanya tinggi di baris tulisan, apa pun warna platnya.
+    """
+    h, w = gray.shape[:2]
+    sub = gray[:, int(w * x1r):int(w * x2r)].astype(np.float32)
+    gx = np.abs(cv2.Sobel(sub, cv2.CV_32F, 1, 0, ksize=3))
+    gx8 = cv2.normalize(gx, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    _, edge = cv2.threshold(gx8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    prof = (edge > 0).mean(axis=1)
+    k = max(1, int(round(h * 0.03)))
+    return np.convolve(prof, np.ones(k) / k, mode="same")
+
+
+def _text_bands(prof, h):
+    """Kelompokkan baris yang profilnya tinggi jadi pita (y_awal, y_akhir). Celah tipis < 4% disambung."""
+    active = prof > max(0.04, 0.30 * float(prof.max()))
+    bands, start = [], None
+    for y, a in enumerate(np.append(active, False)):
+        if a and start is None:
+            start = y
+        elif not a and start is not None:
+            if bands and start - bands[-1][1] < 0.04 * h:
+                bands[-1] = (bands[-1][0], y)
+            else:
+                bands.append((start, y))
+            start = None
+    return bands
+
+
+def _find_tax_rows(gray):
+    """
+    1. Pita nomor utama = pita paling tebal di 75% bagian atas plat.
+    2. Baris pajak dicari di area tepat di bawahnya (sampai 0.8x tinggi huruf utama)
+       dengan ambang lokal, karena angka pajak jauh lebih kecil sehingga profilnya
+       lebih rendah dari nomor utama.
+    Return (y1, y2) atau None kalau tidak ketemu (nanti pakai posisi tetap).
+    """
+    h = gray.shape[0]
+    if h < 20:
+        return None
+    prof = _edge_row_profile(gray)
+    upper = [bd for bd in _text_bands(prof, h) if bd[0] < 0.75 * h]
+    if not upper:
+        return None
+    m1, m2 = max(upper, key=lambda bd: bd[1] - bd[0])
+    main_h = m2 - m1
+    if main_h < 0.2 * h:
+        return None
+
+    r0, r1 = m2, min(h, int(m2 + 0.8 * main_h))
+    seg = prof[r0:r1]
+    if seg.size < 3:
+        return None
+    pk = int(np.argmax(seg))
+    peak = float(seg[pk])
+    if peak < max(0.03, 0.15 * float(prof[m1:m2].mean())):
+        return None
+    a = b = pk
+    while a > 0 and seg[a - 1] > 0.45 * peak:
+        a -= 1
+    while b < seg.size - 1 and seg[b + 1] > 0.45 * peak:
+        b += 1
+    # harus ada jeda (lembah) antara nomor utama dan baris pajak. Kalau tidak ada,
+    # yang ketemu kemungkinan besar masih bagian bawah huruf nomor utama.
+    if a == 0 or float(seg[:a + 1].min()) > 0.6 * peak:
+        return None
+    center = r0 + (a + b) / 2.0
+    # tinggi angka pajak kira-kira 35-50% huruf utama; ROI dibuat sedikit lebih longgar
+    roi_h = max((b - a + 1) * 1.7, 0.50 * main_h)
+    y1 = max(m2 - 2, int(center - roi_h / 2))
+    y2 = min(h, int(center + roi_h / 2) + 1)
+    return (y1, y2) if y2 - y1 >= 6 else None
+
+
 def process_tax_roi(enhanced_gray, yellow_channel=None):
-    """Menghasilkan varian citra ROI angka pajak (bagian bawah tengah pelat)."""
+    """
+    Menghasilkan varian citra ROI angka pajak (bagian bawah tengah pelat).
+    Posisi baris pajak dicari pakai integral proyeksi supaya ikut menyesuaikan
+    letak tulisan di crop. Kalau tidak ketemu, pakai posisi tetap 66%-92% seperti sebelumnya.
+    """
     h, w = enhanced_gray.shape[:2]
-    tax_crop = enhanced_gray[int(h * 0.66):int(h * 0.92), int(w * 0.26):int(w * 0.74)]
+    rows = _find_tax_rows(enhanced_gray)
+    ty1, ty2 = rows if rows else (int(h * 0.66), int(h * 0.92))
+    tax_crop = enhanced_gray[ty1:ty2, int(w * 0.26):int(w * 0.74)]
     tax_sharp = _upscale_and_sharpen(tax_crop, target_h=120, alpha=1.8)
 
     _, tax_otsu = cv2.threshold(tax_sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -260,7 +375,7 @@ def process_tax_roi(enhanced_gray, yellow_channel=None):
     }
 
     if yellow_channel is not None:
-        y_crop = yellow_channel[int(h * 0.66):int(h * 0.92), int(w * 0.26):int(w * 0.74)]
+        y_crop = yellow_channel[ty1:ty2, int(w * 0.26):int(w * 0.74)]
         y_sharp = _upscale_and_sharpen(y_crop, target_h=120, alpha=1.8)
         _, y_otsu = cv2.threshold(y_sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         variants["YellowSharp"] = cv2.copyMakeBorder(y_sharp, 15, 15, 20, 20, cv2.BORDER_REPLICATE)
@@ -437,6 +552,7 @@ def analyze_single_plate(
     min_tax_conf=0.55,
     use_vlm=False,
     vlm_model="qwen3.5:9b",
+    skip_deskew=False,
 ):
     """Menjalankan deteksi + validasi kualitas untuk 1 citra pelat (nomor utama & pajak)."""
     geom_ok, geom_reason, aspect = check_plate_geometry(bgr_img)
@@ -454,7 +570,7 @@ def analyze_single_plate(
             "is_yellow": False,
         }
 
-    prep = preprocess_plate(bgr_img)
+    prep = preprocess_plate(bgr_img, skip_deskew=skip_deskew)
     plate_blurry, lap_score, ten_score = is_too_blurry(prep["gray"], blur_lap_thresh, blur_ten_thresh)
     if plate_blurry:
         return {
