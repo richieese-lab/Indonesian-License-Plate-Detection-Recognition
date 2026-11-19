@@ -149,6 +149,28 @@ def _plate_stats(plate_bgr):
 
 
 # ======================================================================
+# TODO: Modul Deteksi Warna Pelat (HSV) -> Jenis Kendaraan
+# ======================================================================
+class PlateColorClassifier:
+    """
+    TODO: Implementasikan deteksi warna pelat nomor berbasis ruang warna HSV.
+    Target kelas warna:
+      - Hitam  : Kendaraan Pribadi (Pelat Hitam)
+      - Putih  : Kendaraan Pribadi (Pelat Putih)
+      - Kuning : Kendaraan Angkutan Umum / Barang
+      - Merah  : Kendaraan Dinas Pemerintah
+    """
+
+    def classify(self, deskewed_bgr):
+        # TODO: Implementasikan logika klasifikasi warna pelat (HSV) di sini.
+        return {
+            "plate_color": "Belum Didefinisikan",
+            "vehicle_type": "TODO: Klasifikasi Warna Pelat",
+            "hsv_summary": "TODO: Deteksi warna pelat (HSV) dinonaktifkan sementara",
+        }
+
+
+# ======================================================================
 # Tahap 1-3: PlateDetector
 # ======================================================================
 class PlateDetector:
@@ -216,41 +238,48 @@ class PlateDetector:
     # ------------------------------------------------------------------
     def classify_plate_color(self, deskewed_bgr):
         """
-        Klasifikasi warna plat dari ruang warna HSV.
-        - Merah : hue latar merah, tulisannya putih (saturasi rendah) dan lebih terang dari latar
-        - Kuning: hue latar kuning dengan saturasi cukup, tulisannya lebih gelap dari latar
-        - Sisanya plat tidak berwarna (S rendah), dibedakan dari terang-gelapnya:
-            latar lebih terang dari tulisan -> Putih, sebaliknya -> Hitam
-        Ambang-ambangnya diatur dari pengamatan di dataset (split train & val).
+        TODO: Aktifkan kembali setelah implementasi di kelas PlateColorClassifier selesai.
         """
-        if deskewed_bgr is None or deskewed_bgr.size == 0:
-            return {"plate_color": "Hitam", "vehicle_type": VEHICLE_TYPE["Hitam"],
-                    "hsv_summary": "Citra kosong"}
+        # TODO: Sementara didelegasikan ke kerangka kelas PlateColorClassifier
+        return PlateColorClassifier().classify(deskewed_bgr)
 
-        st = _plate_stats(deskewed_bgr)
-        text_brighter = st["fg_y"] > st["bg_y"]
-
-        # Kuning yang sangat jelas (hampir semua piksel latar kuning pekat). Di sini urutan
-        # terang-gelap tidak dicek, karena pantulan cahaya di plat kuning sering lebih terang
-        # dari latarnya sehingga Otsu salah mengira pantulan itu sebagai tulisan.
-        yellow_strong = (st["yellow_ratio"] >= 0.90 and st["bg_s"] >= 120 and st["bg_v"] >= 100)
-
-        if (st["red_ratio"] >= 0.30 and st["bg_v"] >= 65 and st["fg_s"] <= 60 and text_brighter):
-            color = "Merah"
-        elif yellow_strong or (
-                st["yellow_ratio"] >= 0.50 and not text_brighter and
-                (st["bg_s"] >= 100 or (st["bg_s"] >= 75 and st["bg_v"] < 180) or
-                 (st["bg_s"] >= 55 and st["bg_v"] < 100))):
-            # plat putih yang kena lampu kekuningan juga punya S sedang, tapi V-nya tinggi.
-            # Makanya plat kuning yang S-nya tanggung hanya diterima kalau tidak terlalu terang.
-            color = "Kuning"
-        else:
-            color = "Hitam" if text_brighter else "Putih"
-
-        summary = (f"Latar H={st['bg_h']} S={st['bg_s']} V={st['bg_v']} | "
-                   f"Tulisan S={st['fg_s']} V={st['fg_v']} | "
-                   f"piksel merah {st['red_ratio']:.0%}, kuning {st['yellow_ratio']:.0%}")
-        return {"plate_color": color, "vehicle_type": VEHICLE_TYPE[color], "hsv_summary": summary}
+        # --- KODE DETEKSI WARNA PELAT (DI-COMMENT SEMENTARA) ---
+        # """
+        # Klasifikasi warna plat dari ruang warna HSV.
+        # - Merah : hue latar merah, tulisannya putih (saturasi rendah) dan lebih terang dari latar
+        # - Kuning: hue latar kuning dengan saturasi cukup, tulisannya lebih gelap dari latar
+        # - Sisanya plat tidak berwarna (S rendah), dibedakan dari terang-gelapnya:
+        #     latar lebih terang dari tulisan -> Putih, sebaliknya -> Hitam
+        # Ambang-ambangnya diatur dari pengamatan di dataset (split train & val).
+        # """
+        # if deskewed_bgr is None or deskewed_bgr.size == 0:
+        #     return {"plate_color": "Hitam", "vehicle_type": VEHICLE_TYPE["Hitam"],
+        #             "hsv_summary": "Citra kosong"}
+        #
+        # st = _plate_stats(deskewed_bgr)
+        # text_brighter = st["fg_y"] > st["bg_y"]
+        #
+        # # Kuning yang sangat jelas (hampir semua piksel latar kuning pekat). Di sini urutan
+        # # terang-gelap tidak dicek, karena pantulan cahaya di plat kuning sering lebih terang
+        # # dari latarnya sehingga Otsu salah mengira pantulan itu sebagai tulisan.
+        # yellow_strong = (st["yellow_ratio"] >= 0.90 and st["bg_s"] >= 120 and st["bg_v"] >= 100)
+        #
+        # if (st["red_ratio"] >= 0.30 and st["bg_v"] >= 65 and st["fg_s"] <= 60 and text_brighter):
+        #     color = "Merah"
+        # elif yellow_strong or (
+        #         st["yellow_ratio"] >= 0.50 and not text_brighter and
+        #         (st["bg_s"] >= 100 or (st["bg_s"] >= 75 and st["bg_v"] < 180) or
+        #          (st["bg_s"] >= 55 and st["bg_v"] < 100))):
+        #     # plat putih yang kena lampu kekuningan juga punya S sedang, tapi V-nya tinggi.
+        #     # Makanya plat kuning yang S-nya tanggung hanya diterima kalau tidak terlalu terang.
+        #     color = "Kuning"
+        # else:
+        #     color = "Hitam" if text_brighter else "Putih"
+        #
+        # summary = (f"Latar H={st['bg_h']} S={st['bg_s']} V={st['bg_v']} | "
+        #            f"Tulisan S={st['fg_s']} V={st['fg_v']} | "
+        #            f"piksel merah {st['red_ratio']:.0%}, kuning {st['yellow_ratio']:.0%}")
+        # return {"plate_color": color, "vehicle_type": VEHICLE_TYPE[color], "hsv_summary": summary}
 
     # ------------------------------------------------------------------
     # Tahap 3 (lanjutan): Standarisasi polaritas
