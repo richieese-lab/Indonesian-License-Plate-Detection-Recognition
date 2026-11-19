@@ -8,7 +8,8 @@ class PlatePreprocessor:
     Modul Preprocessing Citra Plat Nomor (Tahap 4-6).
     Input: `polarity_std` (BGR/Gray dengan standar latar gelap & teks terang).
     Urutan: Grayscale -> Upscale (min 160px) -> Bilateral Smoothing
-            -> Conditional CLAHE -> Unsharp Masking + Laplacian Sharpness.
+            -> Glare/Background Normalization + Conditional CLAHE
+            -> Unsharp Masking + Laplacian Sharpness.
     """
 
     def __init__(self, clip_limit=2.0, tile_grid_size=(8, 8), std_threshold=45.0):
@@ -39,6 +40,30 @@ class PlatePreprocessor:
         """Reduksi noise dengan Bilateral Filter tanpa mengaburkan tepi huruf (Tahap 4)."""
         return cv2.bilateralFilter(gray_img, d=5, sigmaColor=35, sigmaSpace=35)
 
+    def _suppress_glare_background(self, gray_img):
+        """
+        Redam pencahayaan tidak merata / pantulan cahaya (glare) menggunakan
+        estimasi latar morfologi (White Top-Hat berbobot) agar latar tetap gelap
+        dan karakter tetap terang seragam.
+        """
+        h = gray_img.shape[0]
+        k = max(15, int(h * 0.35) | 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        bg = cv2.morphologyEx(gray_img, cv2.MORPH_OPEN, kernel)
+
+        # Aktifkan peredaman jika latar terlalu terang (glare / washed-out)
+        bg_p50 = float(np.percentile(bg, 50))
+        bg_p90 = float(np.percentile(bg, 90))
+        if bg_p50 > 65.0 or (bg_p90 - bg_p50) > 45.0:
+            suppressed = cv2.subtract(gray_img, (bg.astype(np.float32) * 0.72).astype(np.uint8))
+            p_low = float(np.percentile(suppressed, 10))
+            p_high = float(np.percentile(suppressed, 99.5))
+            if p_high - p_low > 20.0:
+                norm = np.clip((suppressed.astype(np.float32) - p_low) * (255.0 / (p_high - p_low)), 0, 255)
+                return norm.astype(np.uint8)
+            return suppressed
+        return gray_img
+
     def analyze_histogram(self, gray_img):
         """Analisis mean & std histogram untuk menentukan perlunya CLAHE (Tahap 5)."""
         mean_val = float(np.mean(gray_img))
@@ -62,16 +87,16 @@ class PlatePreprocessor:
         return self.clahe.apply(gray_img)
 
     def sharpen(self, gray_img):
-        """Pertajam tepi karakter dengan Unsharp Masking & ukur ketajaman Laplacian (Tahap 6)."""
-        blur = cv2.GaussianBlur(gray_img, (0, 0), 2.0)
-        sharpened = cv2.addWeighted(gray_img, 1.6, blur, -0.6, 0)
+        """Pertajam tepi karakter dengan Unsharp Masking terkendali & ukur Laplacian (Tahap 6)."""
+        blur = cv2.GaussianBlur(gray_img, (0, 0), 1.5)
+        sharpened = cv2.addWeighted(gray_img, 1.35, blur, -0.35, 0)
         sharpness_score = round(float(cv2.Laplacian(sharpened, cv2.CV_64F).var()), 1)
         return sharpened, sharpness_score
 
     def process(self, plate_img, force_clahe=None):
         """
         Alur lengkap Tahap 4-6:
-        Grayscale -> Upscale -> Bilateral -> Conditional CLAHE -> Unsharp Masking.
+        Grayscale -> Upscale -> Bilateral -> Glare Normalization & Conditional CLAHE -> Unsharp Masking.
         """
         if plate_img is None or plate_img.size == 0:
             raise ValueError("Citra plat nomor kosong!")
@@ -79,10 +104,11 @@ class PlatePreprocessor:
         gray = self.to_grayscale(plate_img)
         upscaled = self.upscale_if_small(gray, target_height=160)
         smoothed = self.apply_smoothing(upscaled)
+        leveled = self._suppress_glare_background(smoothed)
 
-        hist_info = self.analyze_histogram(smoothed)
+        hist_info = self.analyze_histogram(leveled)
         apply_it = hist_info["needs_clahe"] if force_clahe is None else force_clahe
-        enhanced = self.enhance_contrast(smoothed) if apply_it else smoothed.copy()
+        enhanced = self.enhance_contrast(leveled) if apply_it else leveled.copy()
 
         sharpened, sharpness_score = self.sharpen(enhanced)
 

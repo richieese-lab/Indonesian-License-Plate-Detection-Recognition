@@ -573,6 +573,10 @@ else:
                         <td class="spec-val">{det['deskew_status']}</td>
                     </tr>
                     <tr>
+                        <td class="spec-key">Pangkas Pinggiran Plat</td>
+                        <td class="spec-val">{det.get('trim_status', 'Tidak dipangkas')}</td>
+                    </tr>
+                    <tr>
                         <td class="spec-key">Standar Polaritas</td>
                         <td class="spec-val">{det['polarity_status']}</td>
                     </tr>
@@ -632,9 +636,10 @@ else:
             st.image(cv2.cvtColor(det["crop"], cv2.COLOR_BGR2RGB), use_container_width=True)
             st.caption(f"Conf={det['confidence']:.2f} | Rasio={det['aspect_ratio']:.2f}")
         with r1[1]:
-            st.markdown('<span class="stage-index">[02]</span> **Deskewing**', unsafe_allow_html=True)
+            st.markdown('<span class="stage-index">[02]</span> **Deskewing &amp; Trim**', unsafe_allow_html=True)
             st.image(cv2.cvtColor(det["deskewed"], cv2.COLOR_BGR2RGB), use_container_width=True)
-            st.caption(det["deskew_status"])
+            trim_caption = f" &bull; {det['trim_status']}" if det.get("trim_status") else ""
+            st.caption(f"{det['deskew_status']}{trim_caption}")
         with r1[2]:
             st.markdown('<span class="stage-index">[03]</span> **Polaritas & HSV**', unsafe_allow_html=True)
             st.image(cv2.cvtColor(det["polarity_std"], cv2.COLOR_BGR2RGB), use_container_width=True)
