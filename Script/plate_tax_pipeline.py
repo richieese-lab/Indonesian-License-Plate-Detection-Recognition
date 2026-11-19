@@ -1,5 +1,6 @@
 import os
 import re
+from collections import Counter
 import glob
 import json
 import base64
@@ -327,7 +328,9 @@ def _find_tax_rows(gray):
     if main_h < 0.2 * h:
         return None
 
-    r0, r1 = m2, min(h, int(m2 + 0.8 * main_h))
+    # jendela pencarian cukup panjang supaya baris pajak tidak terpotong bagian bawahnya
+    # (sebelumnya 0.8x tinggi huruf utama, ternyata kurang kalau jeda antar baris lebar)
+    r0, r1 = m2, min(h, int(m2 + 1.5 * main_h))
     seg = prof[r0:r1]
     if seg.size < 3:
         return None
@@ -346,41 +349,140 @@ def _find_tax_rows(gray):
         return None
     center = r0 + (a + b) / 2.0
     # tinggi angka pajak kira-kira 35-50% huruf utama; ROI dibuat sedikit lebih longgar
-    roi_h = max((b - a + 1) * 1.7, 0.50 * main_h)
+    roi_h = max((b - a + 1) * 1.7, 0.60 * main_h)
     y1 = max(m2 - 2, int(center - roi_h / 2))
     y2 = min(h, int(center + roi_h / 2) + 1)
     return (y1, y2) if y2 - y1 >= 6 else None
 
 
-def process_tax_roi(enhanced_gray, yellow_channel=None):
+def _tax_column_range(gray, y1, y2):
     """
-    Menghasilkan varian citra ROI angka pajak (bagian bawah tengah pelat).
-    Posisi baris pajak dicari pakai integral proyeksi supaya ikut menyesuaikan
-    letak tulisan di crop. Kalau tidak ketemu, pakai posisi tetap 66%-92% seperti sebelumnya.
+    Batas kiri-kanan angka pajak lewat integral proyeksi VERTIKAL (P17) di baris pajak.
+    Di plat motor dan plat model lama, angka pajak ada di kanan bawah, bukan di tengah,
+    jadi lebar tetap 26%-74% sering memotong angkanya.
+    Return (x1, x2) atau None.
+    """
+    h, w = gray.shape[:2]
+    band = gray[y1:y2, :].astype(np.float32)
+    if band.shape[0] < 4 or w < 40:
+        return None
+    gx = np.abs(cv2.Sobel(band, cv2.CV_32F, 1, 0, ksize=3))
+    gx8 = cv2.normalize(gx, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    _, edge = cv2.threshold(gx8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    prof = (edge > 0).mean(axis=0)
+    # tepi kiri-kanan bingkai plat tidak ikut dihitung
+    m = max(1, int(w * 0.04))
+    prof[:m] = 0
+    prof[-m:] = 0
+    k = max(1, int(round(w * 0.02)))
+    prof = np.convolve(prof, np.ones(k) / k, mode="same")
+    if prof.max() <= 0.05:
+        return None
+    active = prof > 0.35 * float(prof.max())
+
+    # kelompokkan kolom aktif, celah sempit (titik pemisah MM.YY bisa cukup lebar) disambung
+    runs, start = [], None
+    for x, on in enumerate(np.append(active, False)):
+        if on and start is None:
+            start = x
+        elif not on and start is not None:
+            if runs and start - runs[-1][1] < 0.09 * w:
+                runs[-1] = (runs[-1][0], x)
+            else:
+                runs.append((start, x))
+            start = None
+    runs = [r for r in runs if 0.10 * w <= r[1] - r[0] <= 0.65 * w]
+    if not runs:
+        return None
+    # angka pajak = kelompok dengan "massa" tepi terbesar (stiker/baut hanya punya sedikit tepi tegak)
+    x1, x2 = max(runs, key=lambda r: float(prof[r[0]:r[1]].sum()))
+    pad = int(w * 0.04)
+    return max(0, x1 - pad), min(w, x2 + pad)
+
+
+def _tax_variants(crop, ycrop=None, prefix=""):
+    sharp = _upscale_and_sharpen(crop, target_h=120, alpha=1.8)
+    _, otsu = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    adap = cv2.adaptiveThreshold(sharp, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 25, 6)
+    # versi abu-abu yang lebih kecil: angka pajak tipis dan rapat, kalau dibinerkan lubang
+    # angka 8/6/9 sering tertutup sehingga terbaca 0. Versi abu-abu tidak punya masalah itu.
+    gray80 = _upscale_and_sharpen(crop, target_h=80, alpha=1.8)
+    v = {
+        prefix + "Sharp": cv2.copyMakeBorder(sharp, 15, 15, 20, 20, cv2.BORDER_REPLICATE),
+        prefix + "Gray80": cv2.copyMakeBorder(gray80, 12, 12, 16, 16, cv2.BORDER_REPLICATE),
+        prefix + "Otsu": _clean_cc(otsu, min_h_ratio=0.35, min_area_abs=15),
+        prefix + "Adaptive": _clean_cc(adap, min_h_ratio=0.35, min_area_abs=15),
+    }
+    if ycrop is not None and ycrop.size:
+        y_sharp = _upscale_and_sharpen(ycrop, target_h=120, alpha=1.8)
+        _, y_otsu = cv2.threshold(y_sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        v[prefix + "YellowSharp"] = cv2.copyMakeBorder(y_sharp, 15, 15, 20, 20, cv2.BORDER_REPLICATE)
+        v[prefix + "YellowOtsu"] = _clean_cc(y_otsu, min_h_ratio=0.35, min_area_abs=15)
+    return v
+
+
+def tax_roi_candidates(enhanced_gray, yellow_channel=None):
+    """
+    Beberapa kandidat ROI angka pajak. OCR nanti dijalankan di semuanya lalu di-voting,
+    jadi kalau satu ROI meleset, ROI lain masih bisa menangkap angkanya.
+      1. "Tengah"   : posisi tetap lama (66%-92% tinggi, 26%-74% lebar). Selalu ikut.
+      2. "Proyeksi" : baris dari proyeksi horizontal + kolom dari proyeksi vertikal.
+      3. "Kolom"    : baris tetap (62%-95%) + kolom dari proyeksi vertikal,
+                      untuk plat yang angka pajaknya di kanan tapi barisnya tidak terdeteksi.
+      4. "Kanan"    : baris pajak + separuh kanan plat (42%-100% lebar).
+    Return: list (nama, (y1, y2, x1, x2)), kandidat yang hampir sama dibuang.
     """
     h, w = enhanced_gray.shape[:2]
+    boxes = [("Tengah", (int(h * 0.66), int(h * 0.92), int(w * 0.26), int(w * 0.74)))]
     rows = _find_tax_rows(enhanced_gray)
-    ty1, ty2 = rows if rows else (int(h * 0.66), int(h * 0.92))
-    tax_crop = enhanced_gray[ty1:ty2, int(w * 0.26):int(w * 0.74)]
-    tax_sharp = _upscale_and_sharpen(tax_crop, target_h=120, alpha=1.8)
+    if rows:
+        cols = _tax_column_range(enhanced_gray, *rows) or (int(w * 0.15), int(w * 0.95))
+        boxes.append(("Proyeksi", (rows[0], rows[1], cols[0], cols[1])))
+    fy1, fy2 = int(h * 0.62), int(h * 0.95)
+    cols = _tax_column_range(enhanced_gray, fy1, fy2)
+    if cols:
+        boxes.append(("Kolom", (fy1, fy2, cols[0], cols[1])))
+    # angka pajak plat lama/motor sering rata kanan, sedangkan bagian kirinya berisi
+    # stiker atau logo dealer yang tepinya bisa lebih kuat dari angka pajak
+    ky1, ky2 = rows if rows else (fy1, fy2)
+    boxes.append(("Kanan", (ky1, ky2, int(w * 0.42), w)))
 
-    _, tax_otsu = cv2.threshold(tax_sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    tax_adap = cv2.adaptiveThreshold(tax_sharp, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 25, 6)
-    tax_sharp_pad = cv2.copyMakeBorder(tax_sharp, 15, 15, 20, 20, cv2.BORDER_REPLICATE)
+    def overlap(a, b):
+        iy = max(0, min(a[1], b[1]) - max(a[0], b[0]))
+        ix = max(0, min(a[3], b[3]) - max(a[2], b[2]))
+        inter = ix * iy
+        ua = (a[1] - a[0]) * (a[3] - a[2]) + (b[1] - b[0]) * (b[3] - b[2]) - inter
+        return inter / ua if ua > 0 else 0.0
 
-    variants = {
-        "Sharp": tax_sharp_pad,
-        "Otsu": _clean_cc(tax_otsu, min_h_ratio=0.35, min_area_abs=15),
-        "Adaptive": _clean_cc(tax_adap, min_h_ratio=0.35, min_area_abs=15),
-    }
+    out = []
+    for name, bx in boxes:
+        if bx[1] - bx[0] < 6 or bx[3] - bx[2] < 12:
+            continue
+        if all(overlap(bx, o[1]) < 0.85 for o in out):
+            out.append((name, bx))
+    return out
 
-    if yellow_channel is not None:
-        y_crop = yellow_channel[ty1:ty2, int(w * 0.26):int(w * 0.74)]
-        y_sharp = _upscale_and_sharpen(y_crop, target_h=120, alpha=1.8)
-        _, y_otsu = cv2.threshold(y_sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        variants["YellowSharp"] = cv2.copyMakeBorder(y_sharp, 15, 15, 20, 20, cv2.BORDER_REPLICATE)
-        variants["YellowOtsu"] = _clean_cc(y_otsu, min_h_ratio=0.35, min_area_abs=15)
 
+def process_tax_roi(enhanced_gray, yellow_channel=None, prefer=None):
+    """
+    Menghasilkan varian citra ROI angka pajak.
+    Kunci "Sharp"/"Otsu"/"Adaptive" (tanpa awalan) = ROI utama untuk ditampilkan:
+    ROI `prefer` kalau diberikan, lalu ROI hasil proyeksi, terakhir ROI tengah lama.
+    Kandidat ROI lain ikut dengan awalan nama, misalnya "Tengah/Otsu".
+    Return: (variants, tax_crop_utama)
+    """
+    cands = tax_roi_candidates(enhanced_gray, yellow_channel)
+    # prefer = ROI yang dipakai hasil bacaan (dari analyze_single_plate), supaya gambar yang
+    # ditampilkan sama dengan yang benar-benar terbaca
+    primary = (next((c for c in cands if c[0] == prefer), None)
+               or next((c for c in cands if c[0] == "Proyeksi"), cands[0]))
+    variants, tax_crop = {}, None
+    for name, (y1, y2, x1, x2) in cands:
+        crop = enhanced_gray[y1:y2, x1:x2]
+        ycrop = yellow_channel[y1:y2, x1:x2] if yellow_channel is not None else None
+        variants.update(_tax_variants(crop, ycrop, "" if name == primary[0] else name + "/"))
+        if name == primary[0]:
+            tax_crop = crop
     return variants, tax_crop
 
 
@@ -418,6 +520,7 @@ def recognize_main_plate(reader, images_dict, min_conf=0.60):
             img, allowlist='0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ',
             paragraph=False, min_size=5, text_threshold=0.4, low_text=0.3, width_ths=1.5
         )
+        res = [r for r in res if r[1].strip()]
         if not res:
             continue
         res.sort(key=lambda x: min(p[0] for p in x[0]))
@@ -507,10 +610,14 @@ def verify_with_local_vlm(bgr_img, model="qwen3.5:9b", endpoint="http://127.0.0.
     }
 
 
-def recognize_tax_date(reader, images_dict, min_conf=0.55):
+_TAX_GRAY_VARIANTS = {"Sharp", "Gray80", "YellowSharp"}
+
+
+def recognize_tax_date(reader, images_dict, min_conf=0.55, return_source=False):
     """
     Membaca angka pajak dengan aturan wajib: 4 angka terpisah oleh '-' (MM-YY).
     Bulan harus 01-12. Jika terhalang/blur/confidence rendah -> TIDAK VALID ('-').
+    return_source=True menambahkan nama ROI asal bacaan (mis. "Kanan") di urutan ke-4.
     """
     candidates = []
     for source_name, img in images_dict.items():
@@ -518,6 +625,8 @@ def recognize_tax_date(reader, images_dict, min_conf=0.55):
             img, allowlist='0123456789-',
             paragraph=False, min_size=4, text_threshold=0.35, low_text=0.25, width_ths=1.5
         )
+        # EasyOCR kadang mengembalikan kotak kosong ('' dengan conf 0) yang ikut menurunkan rata-rata conf
+        res = [r for r in res if r[1].strip()]
         if not res:
             continue
         res.sort(key=lambda x: min(p[0] for p in x[0]))
@@ -527,15 +636,49 @@ def recognize_tax_date(reader, images_dict, min_conf=0.55):
 
         # Prioritaskan pola eksplisit XX-XX jika tanda '-' ikut terbaca, atau tepat 4 digit MMYY
         m_dash = re.search(r'(0[1-9]|1[0-2])\-([0-9]{2})', joined)
-        m_digits = re.fullmatch(r'(0[1-9]|1[0-2])([0-9]{2})', digits) or re.search(r'(0[1-9]|1[0-2])([0-9]{2})', digits)
-        m = m_dash or m_digits
-        if m and conf >= min_conf:
-            candidates.append({"fmt": f"{m.group(1)}-{m.group(2)}", "conf": conf, "source": source_name})
+        m_exact = re.fullmatch(r'(0[1-9]|1[0-2])([0-9]{2})', digits)
+        # titik pemisah MM.YY sering terbaca sebagai angka (12.16 -> "12816"),
+        # jadi kalau ada 5 digit, digit tengahnya dianggap titik
+        m_dot = re.fullmatch(r'(0[1-9]|1[0-2])[0-9]([0-9]{2})', digits)
+        m = m_dash or m_exact or m_dot or re.search(r'(0[1-9]|1[0-2])([0-9]{2})', digits)
+        if m:
+            variant = source_name.split("/")[-1]
+            candidates.append({"fmt": f"{m.group(1)}-{m.group(2)}", "conf": conf, "source": source_name,
+                               "gray": variant in _TAX_GRAY_VARIANTS})
 
-    if not candidates:
-        return "-", 0.0, False
-    best = max(candidates, key=lambda c: c["conf"])
-    return best["fmt"], round(best["conf"], 2), True
+    def roi_of(fmt, gray_only=True):
+        # ROI asal bacaan terbaik untuk angka itu, supaya aplikasi bisa menampilkan crop yang dipakai
+        pool = [c for c in candidates if c["fmt"] == fmt and (c["gray"] or not gray_only)]
+        top = max(pool, key=lambda c: c["conf"]) if pool else None
+        return top["source"].split("/")[0] if top and "/" in top["source"] else None
+
+    def done(fmt, conf, valid, roi=None):
+        return (fmt, conf, valid, roi) if return_source else (fmt, conf, valid)
+
+    # bacaan abu-abu yang ragu (conf 0.45-0.55) tetap dipakai kalau minimal dua varian sepakat
+    weak = Counter(c["fmt"] for c in candidates if c["gray"] and 0.45 <= c["conf"] < min_conf)
+    weak_pick = next((f for f, n in weak.most_common(1) if n >= 2), None)
+    strong = [c for c in candidates if c["conf"] >= min_conf]
+    if not strong:
+        return done(weak_pick, 0.5, True, roi_of(weak_pick)) if weak_pick else done("-", 0.0, False)
+
+    # Voting antar varian & antar ROI. Hasil uji 120 plat test (angka pajak dibaca manual):
+    # varian biner (Otsu/Adaptive) sering menutup lubang angka 8/6/9 sehingga terbaca 0,
+    # dan salahnya kompak di semua ROI. Karena itu suara varian biner diberi bobot setengah,
+    # dan pemenang wajib didukung minimal satu varian abu-abu. Kalau tidak ada,
+    # lebih baik dilaporkan tidak terbaca daripada menampilkan angka yang salah.
+    scores = {}
+    for c in strong:
+        sc = scores.setdefault(c["fmt"], {"score": 0.0, "conf": 0.0, "gray": 0})
+        sc["score"] += (1.0 if c["gray"] else 0.5) * (1.0 + c["conf"])
+        sc["conf"] = max(sc["conf"], c["conf"])
+        sc["gray"] += c["gray"]
+    fmt, best = max(scores.items(), key=lambda kv: kv[1]["score"])
+    if best["gray"] == 0:
+        if weak_pick:
+            return done(weak_pick, 0.5, True, roi_of(weak_pick))
+        return done("-", round(best["conf"], 2), False)
+    return done(fmt, round(best["conf"], 2), True, roi_of(fmt))
 
 
 # ==============================================================================
@@ -590,14 +733,26 @@ def analyze_single_plate(
     p_txt, p_conf, p_valid, p_src, valid_map = recognize_main_plate(reader, main_vars, min_conf=min_plate_conf)
 
     # Evaluasi angka pajak secara terpisah (bisa blur/terhalang meski plat utama jelas)
-    tax_vars, tax_crop = process_tax_roi(prep["enhanced"], prep["yellow_channel"])
-    tax_blurry, tax_lap, tax_ten = is_too_blurry(tax_crop, tax_blur_lap_thresh, tax_blur_ten_thresh)
-    if tax_blurry:
+    # Beberapa kandidat ROI pajak dicek buram atau tidak satu per satu. ROI yang buram
+    # dilewati, sisanya dibaca semua lalu di-voting di recognize_tax_date.
+    enh, ych = prep["enhanced"], prep["yellow_channel"]
+    tax_imgs, laps, t_roi = {}, [], None
+    for name, (ty1, ty2, tx1, tx2) in tax_roi_candidates(enh, ych):
+        crop = enh[ty1:ty2, tx1:tx2]
+        blurry, lap, _ = is_too_blurry(crop, tax_blur_lap_thresh, tax_blur_ten_thresh)
+        laps.append(lap)
+        if not blurry:
+            ycrop = ych[ty1:ty2, tx1:tx2] if ych is not None else None
+            tax_imgs.update(_tax_variants(crop, ycrop, name + "/"))
+    if not tax_imgs:
         t_txt, t_conf, t_valid = "-", 0.0, False
-        t_status = f"TIDAK VALID (Pajak Blur: lap={tax_lap})"
+        t_status = f"TIDAK VALID (Pajak Blur: lap={max(laps) if laps else 0})"
     else:
-        t_txt, t_conf, t_valid = recognize_tax_date(reader, tax_vars, min_conf=min_tax_conf)
-        t_status = "VALID" if t_valid else "TIDAK VALID (Terhalang/Tidak terbaca)"
+        t_txt, t_conf, t_valid, t_roi = recognize_tax_date(reader, tax_imgs, min_conf=min_tax_conf, return_source=True)
+        if t_valid:
+            t_status = f"VALID (ROI {t_roi})" if t_roi else "VALID"
+        else:
+            t_status = "TIDAK VALID (Terhalang/Tidak terbaca)"
 
     # Tahap 2 (Opsional): Konsensus dengan VLM lokal (qwen3.5:9b) untuk akurasi tinggi
     if use_vlm:
@@ -636,7 +791,7 @@ def analyze_single_plate(
             p_src = f"VLM_REJECTED({vlm['reason'] or 'uncertain'})"
 
         if vlm is not None:
-            if not tax_blurry and vlm["tax_valid"]:
+            if tax_imgs and vlm["tax_valid"]:
                 t_txt = vlm["tax_fmt"]
                 t_valid = True
                 t_conf = max(t_conf, 0.85)
@@ -655,6 +810,7 @@ def analyze_single_plate(
         "tax_status": t_status,
         "tax_text": t_txt,
         "tax_conf": t_conf,
+        "tax_roi": t_roi,
         "sharpness_lap": lap_score,
         "is_yellow": prep["is_yellow"],
     }

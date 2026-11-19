@@ -45,6 +45,41 @@ Semua angka di bawah berasal dari dataset Kaggle *Indonesian License Plate Datas
 - **Masalah:** `preprocess_plate()` memutar ulang plat dengan Hough padahal sudah diluruskan `detector.py`. Pada 18% plat terjadi putaran kedua, dan sebagian membatalkan koreksi yang benar (contoh: G 1180 AZ, AC 5928 REY).
 - **Kode:** parameter `skip_deskew` di `preprocess_plate()` dan `analyze_single_plate()`; `app.py` memakai `skip_deskew=True`.
 
+### 1.6 ROI pajak: batas kiri-kanan + OCR beberapa ROI
+- **Masalah (ditemukan dari notebook evaluasi):** dengan YOLO sungguhan, pajak terbaca justru turun dari 32,5% ke 22,5%. Penyebabnya dua: (1) lebar ROI pajak masih tetap 26–74%, padahal di plat motor dan plat model lama angka pajak ada di kanan bawah (contoh 12·16, 09·18), jadi digitnya terpotong; (2) kalau proyeksi baris salah pilih, tidak ada cadangan karena ROI lama tidak dicoba lagi.
+- **Cara kerja:**
+  - Di dalam pita baris pajak, hitung **integral proyeksi vertikal** dari tepi Sobel-x (P17). Kolom yang aktif dikelompokkan, celah sempit (titik pemisah MM·YY) disambung, lalu dipilih kelompok dengan massa tepi terbesar sebagai batas kiri-kanan.
+  - OCR dijalankan pada **tiga ROI**: `Tengah` (posisi tetap lama, selalu ikut), `Proyeksi` (baris + kolom hasil proyeksi), dan `Kolom` (baris bawah tetap + kolom hasil proyeksi). ROI yang hampir sama (IoU ≥ 0,85) cukup dipakai sekali, dan ROI yang blur dilewati.
+  - Hasil dipilih dengan **voting**: setiap varian yang menghasilkan format MM-YY yang sama menambah skor `1 + conf`. Angka yang muncul di beberapa ROI lebih dipercaya daripada satu bacaan yang kebetulan conf-nya tinggi.
+- **Konsekuensi:** OCR pajak lebih lambat (sekitar 2–3× panggilan EasyOCR untuk baris pajak).
+- **Kode:** `_tax_column_range()`, `_tax_variants()`, `tax_roi_candidates()`, `process_tax_roi()`, voting di `recognize_tax_date()`.
+
+### 1.7 Keputusan angka pajak: utamakan tidak salah baca
+- **Kasus pemicu (foto parkiran):** B 6722 PWI terbaca 09-10 padahal 09-18; B 6231 NNZ pajaknya tidak terbaca dan crop yang ditampilkan berisi stiker + "16" saja.
+- **Penyebab yang ditemukan:**
+  - Varian **biner (Otsu)** menutup lubang kecil angka 8 sehingga terbaca 0, dan salahnya sama persis di semua ROI. Voting jadi memilih yang salah karena "sepakat dalam kesalahan".
+  - Jendela pencarian baris pajak di `_find_tax_rows()` terlalu pendek (0,8× tinggi huruf utama), jadi bagian bawah angka pajak terpotong.
+  - Stiker di kiri baris pajak punya tepi tegak yang kuat sehingga proyeksi kolom memilih stiker, bukan angka pajak.
+  - Titik pemisah MM·YY sering terbaca angka ("12816"), dan EasyOCR kadang mengembalikan kotak kosong dengan conf 0 yang menurunkan rata-rata conf.
+- **Perbaikan:**
+  - Jendela pencarian baris pajak diperpanjang jadi 1,5× tinggi huruf utama.
+  - ROI keempat `Kanan` (separuh kanan plat) untuk plat yang angka pajaknya rata kanan.
+  - Varian abu-abu tambahan `Gray80` (diperbesar lebih kecil, tanpa binerisasi).
+  - Voting: suara varian biner berbobot setengah, dan pemenang **wajib didukung minimal satu varian abu-abu**. Kalau tidak ada, hasilnya "tidak terbaca". Bacaan abu-abu yang ragu (conf 0,45–0,55) tetap diterima kalau minimal dua varian sepakat.
+  - Lima digit dengan digit tengah dianggap titik (12816 → 12-16); kotak OCR kosong dibuang sebelum menghitung conf (juga untuk nomor utama).
+  - Status pajak menyebut ROI asal bacaan, dan `app.py` menampilkan crop ROI tersebut (`process_tax_roi(..., prefer=...)`).
+- **Hasil uji** (EasyOCR asli, 120 plat test yang angka pajaknya bisa dibaca manual, crop longgar mirip YOLO):
+
+| Ukuran plat | Versi | Benar | Salah baca | Tidak terbaca |
+|---|---|---|---|---|
+| Asli (lebar ±250 px) | sebelum 1.6–1.7 | 44 | 24 | 52 |
+| Asli (lebar ±250 px) | sekarang | **47** | **12** | 61 |
+| Kecil (lebar 125 px, seperti foto parkiran) | sebelum 1.6–1.7 | 14 | 21 | 85 |
+| Kecil (lebar 125 px, seperti foto parkiran) | sekarang | 11 | **12** | 97 |
+
+  Salah baca turun kira-kira setengahnya. Di plat kecil, jumlah yang benar sedikit turun: angka pajak di sana hanya setinggi ±6–8 piksel, di bawah batas yang bisa dibaca EasyOCR dengan andal, jadi sistem lebih sering memilih "tidak terbaca" daripada menebak.
+- **Kode:** `_find_tax_rows()`, `tax_roi_candidates()`, `_tax_variants()`, `recognize_tax_date(..., return_source=True)`, `process_tax_roi(..., prefer=None)`, `analyze_single_plate()` (kunci baru `tax_roi`).
+
 ---
 
 ## 2. Yang diuji tetapi tidak dipakai
@@ -84,7 +119,7 @@ Efek samping yang diketahui: 3 plat memburuk karena huruf terakhirnya menempel k
 |---|---|---|
 | Nomor plat tepat (exact match) | 11/40 (28%) | **14/40 (35%)** |
 | Character Error Rate (CER) | 62.4% | **56.4%** |
-| Angka pajak terbaca format MM-YY | 11/40 | **12/40** |
+| Angka pajak terbaca format MM-YY | 11/40 | **12/40** (sebelum perbaikan 1.6) |
 
 Catatan: angka ini dihitung dari **semua plat** (plat yang ditolak "TIDAK VALID" dihitung salah), jadi tidak bisa dibandingkan langsung dengan angka README `main` yang hanya menghitung plat yang lolos validasi.
 

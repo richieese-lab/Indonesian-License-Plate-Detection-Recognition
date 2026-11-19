@@ -415,7 +415,7 @@ else:
             main_vars, _ = process_main_plate_roi(
                 prep_vis["enhanced"], prep_vis["yellow_channel"], raw_gray=prep_vis["gray"]
             )
-            tax_vars, _ = process_tax_roi(prep_vis["enhanced"], prep_vis["yellow_channel"])
+            tax_vars, _ = process_tax_roi(prep_vis["enhanced"], prep_vis["yellow_channel"], prefer=ocr_res.get("tax_roi"))
 
             if save_to_output:
                 save_step_output(
