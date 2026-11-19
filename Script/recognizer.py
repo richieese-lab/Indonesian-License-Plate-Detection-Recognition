@@ -4,6 +4,31 @@ import cv2
 import easyocr
 import numpy as np
 
+# Daftar resmi Kode Wilayah TNKB Indonesia (Perpol No. 7 Tahun 2021 + Pemekaran Papua & Khusus)
+INDONESIA_REGION_CODES = frozenset({
+    # 1 Huruf (Jawa & Banten)
+    "A", "B", "D", "E", "F", "G", "H", "K", "L", "M", "N", "P", "R", "S", "T", "W", "Z",
+    # 2 Huruf — Sumatera
+    "BA", "BB", "BD", "BE", "BG", "BH", "BK", "BL", "BM", "BN", "BP",
+    # 2 Huruf — Jawa & DIY
+    "AA", "AB", "AD", "AE", "AG",
+    # 2 Huruf — Bali & Nusa Tenggara
+    "DK", "DR", "EA", "DH", "EB", "ED",
+    # 2 Huruf — Kalimantan
+    "DA", "KB", "KH", "KT", "KU",
+    # 2 Huruf — Sulawesi
+    "DB", "DC", "DD", "DL", "DM", "DN", "DP", "DT", "DW",
+    # 2 Huruf — Maluku & Papua (termasuk kode lama DS & pemekaran baru PS, PT, PY)
+    "DE", "DG", "DS", "PA", "PB", "PS", "PT", "PY",
+    # 2 Huruf — Khusus (Pemerintah Pusat & Korps Diplomatik)
+    "RI", "CD", "CC",
+})
+
+_PREFIX_ALT = "|".join(sorted(INDONESIA_REGION_CODES, key=lambda s: (-len(s), s)))
+# Standar TNKB Indonesia: [Kode Wilayah Sah] [Angka 1-9999 tanpa awalan 0] [1-3 Huruf Seri]
+TNKB_FULL_REGEX = re.compile(rf"^({_PREFIX_ALT})([1-9][0-9]{{0,3}})([A-Z]{{1,3}})$")
+TNKB_FRONT_REGEX = re.compile(rf"^({_PREFIX_ALT})([1-9][0-9]{{0,3}})$")
+
 DICT_CHAR_TO_INT = {
     "O": "0", "D": "0", "Q": "0", "I": "1", "L": "1", "T": "1",
     "Z": "2", "A": "4", "S": "5", "G": "6", "B": "8",
@@ -49,34 +74,64 @@ class PlateRecognizer:
 
     def parse_and_validate_plate(self, raw_combined):
         """
-        Validasi & koreksi posisional pola plat nomor Indonesia:
-        [1-2 Huruf Wilayah] [1-4 Angka] [1-3 Huruf Seri].
+        Validasi & koreksi posisional terstandar TNKB Indonesia (Perpol No. 7 Tahun 2021):
+        [Kode Wilayah Resmi 1-2 Huruf] [Angka 1-9999 tanpa awalan 0] [1-3 Huruf Seri].
         """
         compact = self.clean_text(raw_combined)
 
-        full_match = re.fullmatch(r"([A-Z]{1,2})([0-9]{1,4})([A-Z]{1,3})", compact)
+        # 1. Cocok langsung terhadap standar penuh TNKB Indonesia
+        full_match = TNKB_FULL_REGEX.fullmatch(compact)
         if full_match:
             return f"{full_match.group(1)} {full_match.group(2)} {full_match.group(3)}", True, False
 
-        if 4 <= len(compact) <= 9:
-            for f_len in (1, 2):
-                for b_len in (2, 3, 1):
-                    m_len = len(compact) - f_len - b_len
-                    if 1 <= m_len <= 4:
-                        cand = (
-                            "".join(DICT_INT_TO_CHAR.get(c, c) for c in compact[:f_len])
-                            + "".join(DICT_CHAR_TO_INT.get(c, c) for c in compact[f_len:f_len + m_len])
-                            + "".join(DICT_INT_TO_CHAR.get(c, c) for c in compact[f_len + m_len:])
-                        )
-                        m2 = re.fullmatch(r"([A-Z]{1,2})([0-9]{1,4})([A-Z]{1,3})", cand)
-                        if m2:
-                            return f"{m2.group(1)} {m2.group(2)} {m2.group(3)}", True, False
-
-        front_match = re.match(r"^([A-Z]{1,2})([0-9]{1,4})$", compact)
+        # 1b. Pelat resmi tanpa huruf seri belakang (0-edit, misal B 1234, RI 1)
+        front_match = TNKB_FRONT_REGEX.fullmatch(compact)
         if front_match and len(compact) >= 3:
             return f"{front_match.group(1)} {front_match.group(2)}", True, False
 
-        occluded_left = re.match(r"^([0-9]{1,4})([A-Z]{1,3})$", compact)
+        # 2. Koreksi posisional dengan biaya substitusi minimum (maks 2 karakter)
+        if 3 <= len(compact) <= 9:
+            best_cand = None
+            b_rank = {2: 0, 3: 1, 1: 2}
+            for f_len in (1, 2):
+                for b_len in (2, 3, 1):
+                    m_len = len(compact) - f_len - b_len
+                    if not (1 <= m_len <= 4):
+                        continue
+                    p_raw = compact[:f_len]
+                    m_raw = compact[f_len:f_len + m_len]
+                    s_raw = compact[f_len + m_len:]
+
+                    p_fix = "".join(DICT_INT_TO_CHAR.get(c, c) for c in p_raw)
+                    if p_fix not in INDONESIA_REGION_CODES:
+                        continue
+                    m_fix = "".join(DICT_CHAR_TO_INT.get(c, c) for c in m_raw)
+                    if not re.fullmatch(r"[1-9][0-9]{0,3}", m_fix):
+                        continue
+                    s_fix = "".join(DICT_INT_TO_CHAR.get(c, c) for c in s_raw)
+                    if not re.fullmatch(r"[A-Z]{1,3}", s_fix):
+                        continue
+
+                    cand_str = p_fix + m_fix + s_fix
+                    edits = sum(a != b for a, b in zip(compact, cand_str))
+                    if edits > 2:
+                        continue
+                    # Prioritas: jumlah substitusi terkecil, lalu preferensi seri 2/3/1 huruf
+                    key = (edits, b_rank[b_len], f_len)
+                    if best_cand is None or key < best_cand[0]:
+                        best_cand = (key, f"{p_fix} {m_fix} {s_fix}")
+
+            if best_cand is not None:
+                return best_cand[1], True, False
+
+        # 3. Buang 1 artefak tepi (misal bingkai kiri/kanan terbaca I/1/L/Q) jika sisanya cocok persis TNKB
+        if 5 <= len(compact) <= 10:
+            for trimmed in (compact[1:], compact[:-1]):
+                m_trim = TNKB_FULL_REGEX.fullmatch(trimmed)
+                if m_trim:
+                    return f"{m_trim.group(1)} {m_trim.group(2)} {m_trim.group(3)}", True, False
+
+        occluded_left = re.match(r"^([1-9][0-9]{0,3})([A-Z]{1,3})$", compact)
         if occluded_left:
             return f"{occluded_left.group(1)} {occluded_left.group(2)}", False, True
 
