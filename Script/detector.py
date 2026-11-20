@@ -43,6 +43,39 @@ def _rotate(img, angle, border=cv2.BORDER_REPLICATE):
     return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=border)
 
 
+def _rotate_expand(img, angle, border=cv2.BORDER_REPLICATE):
+    """
+    Putar citra tanpa memotong isinya: kanvas diperbesar mengikuti ukuran hasil putaran.
+    Kotak YOLO plat miring memuat plat dari sudut ke sudut, jadi kalau diputar di kanvas
+    yang sama ukurannya, ujung-ujung plat (huruf terakhir, angka pajak) ikut terbuang.
+    """
+    h, w = img.shape[:2]
+    M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle, 1.0)
+    c, s = abs(M[0, 0]), abs(M[0, 1])
+    nw, nh = int(round(w * c + h * s)), int(round(w * s + h * c))
+    M[0, 2] += nw / 2.0 - w / 2.0
+    M[1, 2] += nh / 2.0 - h / 2.0
+    return cv2.warpAffine(img, M, (nw, nh), flags=cv2.INTER_CUBIC, borderMode=border)
+
+
+def _rotate_with_context(context, box_xywh, angle):
+    """
+    Seperti _rotate_expand, tapi bahan putarannya potongan gambar asli yang lebih besar
+    dari kotak YOLO. Jadi bagian yang "masuk" ke kanvas saat diputar adalah isi foto
+    sebenarnya, bukan piksel tepi yang direntangkan (BORDER_REPLICATE membuat garis-garis
+    panjang palsu yang bisa dikira garis bingkai oleh trim_plate_margins).
+    Pusat putaran = pusat kotak YOLO, dan hasilnya selalu menaruh pusat itu di tengah kanvas.
+    """
+    x, y, w, h = box_xywh
+    cx, cy = x + w / 2.0, y + h / 2.0
+    M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
+    c, s = abs(M[0, 0]), abs(M[0, 1])
+    nw, nh = int(round(w * c + h * s)), int(round(w * s + h * c))
+    M[0, 2] += nw / 2.0 - cx
+    M[1, 2] += nh / 2.0 - cy
+    return cv2.warpAffine(context, M, (nw, nh), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+
 def _text_mask(gray):
     """Mask tulisan (255). Hasil Otsu dibalik kalau perlu, karena piksel tulisan selalu lebih sedikit dari latar."""
     _, b = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -82,34 +115,40 @@ def estimate_skew(plate_bgr, max_angle=MAX_SKEW_DEG):
     return float(np.clip(best, -max_angle, max_angle)), gain
 
 
-def _tighten_after_rotation(img, angle, margin=0.06):
+def _tighten_after_rotation(img, angle, box_w, box_h, margin=0.06):
     """
     Kotak YOLO selalu tegak, jadi plat yang miring ikut membawa bodi mobil di
-    sudut-sudutnya. Setelah plat diluruskan, ukuran plat asli bisa dihitung balik
-    dari ukuran kotak dan sudutnya:
+    sudut-sudutnya. Ukuran plat asli bisa dihitung balik dari ukuran kotak dan sudutnya:
         W = wp*cos + hp*sin
         H = wp*sin + hp*cos
-    lalu area di luar plat dipotong supaya pembacaan warna tidak tercampur.
+    `img` adalah hasil _rotate_expand, jadi plat ada tepat di tengah kanvas. Bagian
+    tengah seukuran plat itulah yang diambil.
     """
     H, W = img.shape[:2]
     t = np.radians(abs(angle))
     c, s = np.cos(t), np.sin(t)
     d = c * c - s * s
-    if d <= 0.2:
-        return img
-    wp = (c * W - s * H) / d
-    hp = (c * H - s * W) / d
-    # Cek kewajaran hasil hitungan:
-    # - untuk kemiringan <= 25 derajat, lebar plat asli seharusnya masih >= 75% lebar kotak
-    # - rasio panjang:tinggi plat hasil hitungan harus masuk akal (plat motor ~2, mobil ~3-4)
-    # Kalau tidak wajar, biasanya platnya melengkung atau sudutnya kurang tepat,
-    # jadi lebih aman tidak dipotong daripada tulisannya ikut terpotong.
-    if wp < 0.75 * W or hp <= 0 or not (1.5 <= wp / hp <= 5.5):
-        return img
-    wp = min(W, wp * (1 + margin))
-    hp = min(H, hp * (1 + 2 * margin))
-    x1, y1 = int((W - wp) / 2), int((H - hp) / 2)
-    return img[y1:y1 + int(hp), x1:x1 + int(wp)].copy()
+    # kalau hitungan tidak bisa dipakai, ambil tengah seukuran kotak asli (sama seperti
+    # rotasi biasa), sisa bodi mobil nanti dibuang trim_plate_margins()
+    fallback_w, fallback_h = min(W, box_w), min(H, box_h)
+    wp = hp = None
+    if d > 0.2:
+        wp = (c * box_w - s * box_h) / d
+        hp = (c * box_h - s * box_w) / d
+        # Cek kewajaran: rasio panjang:tinggi plat harus masuk akal (plat motor ~2, mobil ~3-4).
+        # Pada sudut besar hp adalah selisih dua angka yang mirip, jadi salah sudut 1-2 derajat
+        # sudah membuatnya meleset jauh. Kalau tidak wajar, pakai cadangan.
+        if hp <= 0 or wp <= 0 or not (1.5 <= wp / hp <= 5.5):
+            wp = hp = None
+    if wp is None:
+        wp, hp = fallback_w, fallback_h
+        m_w, m_h = 0.0, 0.0
+    else:
+        m_w, m_h = margin, 2 * margin
+    wp = min(W, wp * (1 + m_w))
+    hp = min(H, hp * (1 + m_h))
+    x1, y1 = int(round((W - wp) / 2)), int(round((H - hp) / 2))
+    return img[y1:y1 + int(round(hp)), x1:x1 + int(round(wp))].copy()
 
 
 def _plate_stats(plate_bgr):
@@ -271,6 +310,12 @@ def trim_plate_margins(plate_bgr):
     if box is None:
         return plate_bgr, (0, h, 0, w), "Tidak dipangkas (huruf tidak terdeteksi)"
     tx1, ty1, tx2, ty2, ch = box
+    # Nomor utama selalu membentang lebih dari separuh lebar plat. Kalau kotak hurufnya
+    # sempit, berarti sebagian besar huruf menyatu dengan bingkai (biasanya plat kecil/jauh)
+    # dan yang terdeteksi cuma beberapa potongan. Memangkas dari kotak sesempit itu malah
+    # memotong huruf, jadi lebih aman dibiarkan.
+    if (tx2 - tx1) < 0.5 * w:
+        return plate_bgr, (0, h, 0, w), "Tidak dipangkas (huruf hanya terdeteksi sebagian)"
     bgf = bg.astype(np.float32)
 
     rows = bgf[:, tx1:tx2].mean(axis=1)
@@ -386,10 +431,12 @@ class PlateDetector:
     # ------------------------------------------------------------------
     # Tahap 2: Deskewing
     # ------------------------------------------------------------------
-    def deskew_plate(self, crop_bgr):
+    def deskew_plate(self, crop_bgr, context=None):
         """
         Luruskan plat yang miring, maksimal +/- MAX_SKEW_DEG derajat.
         Setelah diputar, area bodi mobil di sekitar plat ikut dipotong.
+        context: (gambar_lebih_besar, (x, y)) yaitu potongan foto di sekitar kotak YOLO dan
+                 posisi kiri-atas crop di dalamnya. Kalau ada, rotasi memakai isi foto asli.
         Return: (citra_lurus, sudut_koreksi, status)
         """
         if crop_bgr is None or crop_bgr.size == 0:
@@ -401,8 +448,12 @@ class PlateDetector:
         if gain < MIN_SKEW_GAIN:
             return crop_bgr.copy(), 0.0, f"Tidak dikoreksi (estimasi {angle:+.1f} derajat kurang meyakinkan)"
 
-        rotated = _rotate(crop_bgr, angle)
-        out = _tighten_after_rotation(rotated, angle)
+        if context is not None:
+            ctx_img, (ox, oy) = context
+            rotated = _rotate_with_context(ctx_img, (ox, oy, crop_bgr.shape[1], crop_bgr.shape[0]), angle)
+        else:
+            rotated = _rotate_expand(crop_bgr, angle)
+        out = _tighten_after_rotation(rotated, angle, crop_bgr.shape[1], crop_bgr.shape[0])
         status = f"Dikoreksi {angle:+.1f} derajat"
         if abs(angle) >= MAX_SKEW_DEG - 0.5:
             status += " (mentok batas, cek manual)"
@@ -452,9 +503,9 @@ class PlateDetector:
         return out, inverted, status
 
     # ------------------------------------------------------------------
-    def process_crop(self, crop_bgr):
+    def process_crop(self, crop_bgr, context=None):
         """Jalankan tahap 2-3 untuk satu crop plat. Dipakai detect() dan tes mandiri."""
-        deskewed, skew_angle, deskew_status = self.deskew_plate(crop_bgr)
+        deskewed, skew_angle, deskew_status = self.deskew_plate(crop_bgr, context)
         # setelah lurus, pinggiran bingkai/bodi mobil dibuang supaya tahap berikutnya
         # (warna, polaritas, binerisasi) hanya melihat plat
         deskewed, trim_box, trim_status = trim_plate_margins(deskewed)
@@ -601,7 +652,11 @@ class PlateDetector:
                 if not (0.70 <= raw_ar <= 5.0 and self._has_plate_texture(crop_img)):
                     continue
 
-            processed = self.process_crop(crop_img)
+            # potongan foto yang lebih besar dari kotak, dipakai saat plat diputar
+            px, py = w // 2, h // 2
+            cx1, cy1 = max(0, x1 - px), max(0, y1 - py)
+            context = (image[cy1:min(img_h, y2 + py), cx1:min(img_w, x2 + px)], (x1 - cx1, y1 - cy1))
+            processed = self.process_crop(crop_img, context)
             # Hitung aspek rasio: untuk pelat miring (>= 15 deg), kotak axis-aligned tampak persegi,
             # jadi evaluasi keutuhan mempertimbangkan kemiringan agar pelat miring utuh tidak dianggap terhalang.
             dw, dh = processed["deskewed"].shape[1], processed["deskewed"].shape[0]
