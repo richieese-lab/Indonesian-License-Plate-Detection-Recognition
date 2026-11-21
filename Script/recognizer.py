@@ -64,11 +64,21 @@ class PlateRecognizer:
     def _prepare_for_ocr(image):
         """
         EasyOCR paling akurat pada teks gelap di atas latar terang.
-        Jika input biner berlatar hitam (0) & teks putih (255), balik secara internal.
+        Cek median piksel tepi/border (lebih tahan pantulan glare dibanding mean global):
+        jika latar tepi gelap (< 120), balik secara internal agar teks menjadi gelap di latar terang.
         """
         if image is None or image.size == 0:
             return image
-        if float(np.mean(image)) < 110.0:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+        h, w = gray.shape[:2]
+        pad = max(2, min(4, h // 10, w // 10))
+        border_pixels = np.concatenate([
+            gray[:pad, :].ravel(),
+            gray[-pad:, :].ravel(),
+            gray[:, :pad].ravel(),
+            gray[:, -pad:].ravel(),
+        ])
+        if float(np.median(border_pixels)) < 120.0:
             return cv2.bitwise_not(image)
         return image
 
@@ -142,6 +152,7 @@ class PlateRecognizer:
 
     def _extract_main_characters(self, image):
         ocr_img = self._prepare_for_ocr(image)
+        img_h = ocr_img.shape[0] if ocr_img is not None and ocr_img.size > 0 else 1
         results = self.reader.readtext(
             ocr_img,
             allowlist="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
@@ -164,20 +175,75 @@ class PlateRecognizer:
             ys = [pt[1] for pt in bbox]
             xs = [pt[0] for pt in bbox]
             box_h = max(ys) - min(ys)
+            y_center = (min(ys) + max(ys)) / 2.0
             max_h = max(max_h, box_h)
-            blocks.append({"text": clean, "conf": float(conf), "box_h": box_h, "x_left": min(xs)})
+            blocks.append({
+                "text": clean,
+                "conf": float(conf),
+                "box_h": box_h,
+                "x_left": min(xs),
+                "y_center": y_center,
+            })
 
         if not blocks:
             return "", 0.0
 
-        main_blocks = [b for b in blocks if b["box_h"] >= 0.40 * max_h] or blocks
+        # Saring noise pendek & blok angka pajak yang pusat vertikalnya berada di bawah 72% tinggi citra
+        upper_blocks = [
+            b for b in blocks
+            if b["box_h"] >= 0.40 * max_h
+            and not (b["y_center"] > 0.72 * img_h and b["box_h"] < 0.70 * max_h)
+        ]
+        main_blocks = upper_blocks or [b for b in blocks if b["box_h"] >= 0.40 * max_h] or blocks
         main_blocks.sort(key=lambda item: item["x_left"])
         combined_text = " ".join(b["text"] for b in main_blocks)
         avg_conf = float(np.mean([b["conf"] for b in main_blocks]))
         return combined_text, avg_conf
 
+    def _character_level_consensus(self, valid_cands):
+        """
+        Voting tingkat karakter untuk kandidat regex-valid yang memiliki panjang karakter sama
+        (misal 'H8957FE' vs 'H8957FF'), berbobot nilai confidence.
+        """
+        groups = {}
+        for c in valid_cands:
+            compact = c["fmt"].replace(" ", "")
+            groups.setdefault(len(compact), []).append((compact, c["conf"]))
+
+        best_char_cand = None
+        for length, items in groups.items():
+            if len(items) < 2:
+                continue
+            voted_chars = []
+            char_confs = []
+            for pos in range(length):
+                pos_scores = {}
+                for txt, cf in items:
+                    pos_scores[txt[pos]] = pos_scores.get(txt[pos], 0.0) + max(0.1, cf)
+                best_ch = max(pos_scores.items(), key=lambda kv: kv[1])[0]
+                voted_chars.append(best_ch)
+                agree_confs = [cf for txt, cf in items if txt[pos] == best_ch]
+                char_confs.append(float(np.mean(agree_confs)))
+
+            voted_compact = "".join(voted_chars)
+            fmt, ok, occ = self.parse_and_validate_plate(voted_compact)
+            if ok:
+                avg_c = float(np.mean(char_confs))
+                total_w = sum(cf for _, cf in items)
+                if best_char_cand is None or total_w > best_char_cand[0]:
+                    best_char_cand = (total_w, {
+                        "source": "Consensus Voting (Karakter)",
+                        "raw": voted_compact,
+                        "fmt": fmt,
+                        "conf": round(avg_c, 3),
+                        "valid": True,
+                        "occ": occ,
+                        "regex_ok": True,
+                    })
+        return best_char_cand[1] if best_char_cand else None
+
     def recognize(self, image_input, fallback_image=None, extra_images=None):
-        """Voting OCR 3 kandidat (Biner Utama, Grayscale Tajam, Biner Alternatif)."""
+        """Voting OCR multi-kandidat dengan consensus boost & character-level voting."""
         if image_input is None or (isinstance(image_input, np.ndarray) and image_input.size == 0):
             return {
                 "raw_text": "",
@@ -199,17 +265,20 @@ class PlateRecognizer:
                     sources.append((label, im))
 
         candidates = []
+        fmt_counts = {}
         for name, img in sources:
             raw, conf = self._extract_main_characters(img)
             fmt, val, occ = self.parse_and_validate_plate(raw)
             if fmt and fmt != "TIDAK TERBACA":
-                is_valid = bool(val and conf >= 0.55)
+                key = fmt.replace(" ", "")
+                fmt_counts[key] = fmt_counts.get(key, 0) + 1
                 candidates.append({
                     "source": name,
                     "raw": raw,
                     "fmt": fmt,
                     "conf": round(conf, 3),
-                    "valid": is_valid,
+                    "regex_ok": bool(val),
+                    "valid": bool(val and conf >= 0.55),
                     "occ": occ,
                 })
 
@@ -224,24 +293,39 @@ class PlateRecognizer:
                 "all_candidates": [],
             }
 
+        # Consensus boost: izinkan conf >= 0.35 jika minimal 2 kandidat sepakat pada hasil yang sama
+        for c in candidates:
+            key = c["fmt"].replace(" ", "")
+            if c["regex_ok"] and (c["conf"] >= 0.55 or (c["conf"] >= 0.35 and fmt_counts.get(key, 0) >= 2)):
+                c["valid"] = True
+
         valid_cands = [c for c in candidates if c["valid"]]
         if valid_cands:
             scores = {}
             for c in valid_cands:
                 key = c["fmt"].replace(" ", "")
-                scores.setdefault(key, {"score": 0.0, "best": c})
+                scores.setdefault(key, {"score": 0.0, "count": 0, "best": c})
                 scores[key]["score"] += 1.0 + c["conf"]
+                scores[key]["count"] += 1
                 if c["conf"] > scores[key]["best"]["conf"]:
                     scores[key]["best"] = c
+
             best = max(scores.values(), key=lambda s: s["score"])["best"]
+            # Jika semua kandidat berbeda-beda (tidak ada yang sepakat >= 2), coba character-level voting
+            if max(s["count"] for s in scores.values()) == 1 and len(valid_cands) >= 2:
+                char_cand = self._character_level_consensus(valid_cands)
+                if char_cand is not None:
+                    best = char_cand
         else:
-            best = max(candidates, key=lambda c: (len(c["fmt"].replace(" ", "")), c["conf"]))
+            regex_cands = [c for c in candidates if c["regex_ok"]]
+            pool = regex_cands if regex_cands else candidates
+            best = max(pool, key=lambda c: (len(c["fmt"].replace(" ", "")), c["conf"]))
 
         return {
             "raw_text": best["raw"],
             "clean_text": best["fmt"],
             "confidence": round(best["conf"], 2),
-            "is_valid_format": best["valid"],
+            "is_valid_format": best["valid"] or best["regex_ok"],
             "is_occluded": best["occ"],
             "source": best["source"],
             "all_candidates": candidates,
@@ -255,17 +339,22 @@ class PlateRecognizer:
     def recognize_tax(self, tax_binary, tax_gray=None, current_date=None):
         """
         [KEBARUAN 2] Membaca masa berlaku pajak MM.YY pada ROI Pajak
+        (memberi bobot prioritas pada varian grayscale dibanding biner agar digit seperti 4 dan 8 tidak terputus)
         dan mengklasifikasikan status PAJAK AKTIF vs MATI / KEDALUWARSA.
         """
         now = current_date or datetime.now()
         inputs = []
         if tax_gray is not None and tax_gray.size > 0:
-            inputs.append(tax_gray)
+            inputs.append(("tax_gray", tax_gray, 0.15))
+            clahe_tax = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(
+                cv2.cvtColor(tax_gray, cv2.COLOR_BGR2GRAY) if tax_gray.ndim == 3 else tax_gray
+            )
+            inputs.append(("tax_gray_clahe", clahe_tax, 0.12))
         if tax_binary is not None and tax_binary.size > 0:
-            inputs.append(tax_binary)
+            inputs.append(("tax_binary", tax_binary, 0.0))
 
-        best_match = None
-        for im in inputs:
+        tax_scores = {}
+        for _, im, bonus in inputs:
             ocr_im = self._prepare_for_ocr(im)
             results = self.reader.readtext(
                 ocr_im,
@@ -278,19 +367,25 @@ class PlateRecognizer:
             )
             if not results:
                 continue
-            raw_joined = "".join(t for _, t, _ in results)
-            avg_conf = float(np.mean([c for _, _, c in results]))
+            ordered = sorted(results, key=lambda r: min(pt[0] for pt in r[0]))
+            raw_joined = "".join(t for _, t, _ in ordered)
+            avg_conf = float(np.mean([c for _, _, c in ordered]))
             digits_only = re.sub(r"[^0-9]", "", self._correct_tax_digits(raw_joined))
 
             m = re.search(r"(0[1-9]|1[0-2])([1-4][0-9])", digits_only)
             if m:
                 month, year_short = int(m.group(1)), int(m.group(2))
                 year_full = 2000 + year_short
-                cand = (month, year_full, f"{month:02d}.{year_short:02d}", round(avg_conf, 2))
-                if best_match is None or cand[3] > best_match[3]:
-                    best_match = cand
+                tax_fmt = f"{month:02d}.{year_short:02d}"
+                entry = tax_scores.setdefault(
+                    tax_fmt,
+                    {"score": 0.0, "best_conf": 0.0, "month": month, "year_full": year_full},
+                )
+                entry["score"] += 0.5 + avg_conf + bonus
+                if avg_conf > entry["best_conf"]:
+                    entry["best_conf"] = avg_conf
 
-        if best_match is None:
+        if not tax_scores:
             return {
                 "tax_text": "TIDAK TERBACA",
                 "tax_month": None,
@@ -300,10 +395,13 @@ class PlateRecognizer:
                 "tax_confidence": 0.0,
             }
 
-        month, year_full, tax_fmt, tax_conf = best_match
+        best_fmt, best_info = max(tax_scores.items(), key=lambda kv: kv[1]["score"])
+        month = best_info["month"]
+        year_full = best_info["year_full"]
+        tax_conf = round(best_info["best_conf"], 2)
         is_active = (year_full, month) >= (now.year, now.month)
         return {
-            "tax_text": tax_fmt,
+            "tax_text": best_fmt,
             "tax_month": month,
             "tax_year": year_full,
             "is_tax_active": is_active,

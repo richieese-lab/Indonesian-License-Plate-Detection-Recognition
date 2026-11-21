@@ -174,13 +174,13 @@ class PlateBinarizer:
 
     def _extract_tax_roi(self, sharpened_gray):
         """
-        Ekstrak ROI Angka Pajak MM.YY di bagian tengah-bawah pelat (Tahap 9b):
-        y: 60%-96% tinggi, x: 18%-82% lebar agar tidak membawa teks dudukan pelat
-        namun tetap menangkap posisi pajak sedikit ke kanan pada plat motor/lama.
+        Ekstrak ROI Angka Pajak MM.YY di bagian bawah pelat (Tahap 9b):
+        y: 58%-98% tinggi, x: 6%-96% lebar agar tidak membawa teks dudukan pelat
+        namun tetap menangkap posisi pajak di tengah maupun kanan-bawah pada plat motor/lama.
         """
         h, w = sharpened_gray.shape[:2]
-        y1, y2 = int(h * 0.60), int(h * 0.96)
-        x1, x2 = int(w * 0.18), int(w * 0.82)
+        y1, y2 = int(h * 0.58), int(h * 0.98)
+        x1, x2 = int(w * 0.04), w
         crop_gray = sharpened_gray[y1:y2, x1:x2]
         if crop_gray.size == 0:
             crop_gray = sharpened_gray
@@ -195,14 +195,16 @@ class PlateBinarizer:
         if np.count_nonzero(tax_bin) > tax_bin.size * 0.55:
             tax_bin = cv2.bitwise_not(tax_bin)
 
-        # Bersihkan noise mikro dan garis bingkai pada ROI pajak
+        # Bersihkan noise mikro, garis bingkai tepi, dan sisa ujung huruf baris utama pada ROI pajak
         th, tw = tax_bin.shape[:2]
         n, labels, stats, _ = cv2.connectedComponentsWithStats(tax_bin, connectivity=8)
         min_tax_area = max(10, int(th * tw * 0.002))
         for i in range(1, n):
             x, y, cw, ch, area = stats[i]
             touches_border = (y <= 1 and cw > 0.25 * tw) or (y + ch >= th - 1 and cw > 0.25 * tw)
-            if area < min_tax_area or cw > 0.55 * tw or touches_border:
+            touches_side_line = (x <= 1 or x + cw >= tw - 1) and (ch > 0.75 * th and cw <= max(4, int(tw * 0.025)))
+            touches_top_main = (y <= 1 and (y + ch) < 0.28 * th)
+            if area < min_tax_area or cw > 0.55 * tw or touches_border or touches_side_line or touches_top_main:
                 tax_bin[labels == i] = 0
 
         tax_gray_ocr = self._to_ocr_dark_on_white(tax_gray_raw, use_clahe=False)
@@ -228,7 +230,7 @@ class PlateBinarizer:
 
         h, w = sharpened_gray.shape[:2]
         # Detector sudah memangkas bingkai luar, jadi jangan memotong tepi kiri/kanan terlalu agresif
-        main_gray = sharpened_gray[int(h * 0.01):int(h * 0.75), 0:w]
+        main_gray = sharpened_gray[int(h * 0.01):int(h * 0.72), 0:w]
         if main_gray.size == 0:
             main_gray = sharpened_gray
 

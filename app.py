@@ -1,6 +1,8 @@
 # Aesthetic Archetype: A. Precision Technical Dark (HeyPuter AI Builder / Linear / v0 Split-Pane Studio)
 import glob
+import hashlib
 import os
+import textwrap
 import urllib.request
 import cv2
 import numpy as np
@@ -297,6 +299,7 @@ def decode_uploaded_image(uploaded_file):
     return cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
 
+@st.cache_data(show_spinner=False)
 def decode_url_image(url):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=12) as resp:
@@ -332,7 +335,7 @@ def run_full_pipeline(image_bgr, detector, preprocessor, binarizer, recognizer, 
 
         ocr_main = recognizer.recognize(
             bin_res["roi_cleaned"],
-            fallback_image=pre_res["sharpened"],
+            fallback_image=bin_res["upscaled_gray"],
             extra_images=bin_res["variants"],
         )
         ocr_tax = recognizer.recognize_tax(
@@ -447,18 +450,31 @@ if image_bgr is None:
 else:
     detector, preprocessor, binarizer, recognizer = load_pipeline_modules()
 
-    with st.spinner("Menjalankan pipeline 11 tahap (YOLO -> Deskew -> HSV -> PCD -> Dual-ROI OCR)..."):
-        all_candidates, used_direct = run_full_pipeline(
-            image_bgr, detector, preprocessor, binarizer, recognizer, allow_direct_plate
-        )
+    image_hash = hashlib.sha256(image_bgr.tobytes()).hexdigest()
+    cache_key = (image_hash, bool(allow_direct_plate))
+
+    if st.session_state.get("pipeline_cache_key") != cache_key:
+        with st.spinner("Menjalankan pipeline 11 tahap (YOLO -> Deskew -> HSV -> PCD -> Dual-ROI OCR)..."):
+            all_candidates, used_direct = run_full_pipeline(
+                image_bgr, detector, preprocessor, binarizer, recognizer, allow_direct_plate
+            )
+        st.session_state["pipeline_cache_key"] = cache_key
+        st.session_state["pipeline_all_candidates"] = all_candidates
+        st.session_state["pipeline_used_direct"] = used_direct
+        st.session_state["pipeline_gt_val"] = get_ground_truth(image_name)
+        st.session_state["plate_inspector_idx"] = 0
+        st.session_state.pop("annot_cache_key", None)
+        st.session_state.pop("annot_cache_img", None)
+
+    all_candidates = st.session_state["pipeline_all_candidates"]
+    used_direct = st.session_state["pipeline_used_direct"]
+    gt_val = st.session_state["pipeline_gt_val"]
 
     has_valid = any(d["plate_valid"] for d in all_candidates)
     if hide_false_positives and has_valid:
         detections = [d for d in all_candidates if d["plate_valid"]]
     else:
         detections = all_candidates
-
-    gt_val = get_ground_truth(image_name)
 
     total_det = len(detections)
     valid_det = sum(1 for d in detections if d["plate_valid"])
@@ -476,33 +492,41 @@ else:
     with left_pane:
         mode_tag = "DIRECT FALLBACK" if used_direct else f"YOLO: {len(detections)} TERDETEKSI"
         st.markdown(
-            f"""
-        <div class="pane-box">
-            <div class="pane-header">
+            textwrap.dedent(
+                f"""
+                <div class="pane-box">
+                <div class="pane-header">
                 <span class="pane-label">Canvas / Visual Localization</span>
                 <span class="pane-meta">{image_name} &middot; {mode_tag}</span>
-            </div>
-        </div>
-        """,
+                </div>
+                </div>
+                """
+            ).strip(),
             unsafe_allow_html=True,
         )
         tab_annot, tab_orig = st.tabs(["Hasil Deteksi & Anotasi", "Citra Asli"])
         with tab_annot:
-            annotated_bgr = draw_plate_annotations(image_bgr, detections)
+            annot_key = (cache_key, bool(hide_false_positives))
+            if st.session_state.get("annot_cache_key") != annot_key:
+                st.session_state["annot_cache_img"] = draw_plate_annotations(image_bgr, detections)
+                st.session_state["annot_cache_key"] = annot_key
+            annotated_bgr = st.session_state["annot_cache_img"]
             st.image(cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB), use_container_width=True)
         with tab_orig:
             st.image(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB), use_container_width=True)
 
     with right_pane:
         st.markdown(
-            """
-        <div class="pane-box">
-            <div class="pane-header">
+            textwrap.dedent(
+                """
+                <div class="pane-box">
+                <div class="pane-header">
                 <span class="pane-label">Inspector / Kebaruan & Telemetri</span>
                 <span class="pane-meta">HSV + DUAL-ROI TAX</span>
-            </div>
-        </div>
-        """,
+                </div>
+                </div>
+                """
+            ).strip(),
             unsafe_allow_html=True,
         )
 
@@ -510,9 +534,12 @@ else:
             st.warning("Tidak ada pelat nomor yang terdeteksi pada gambar ini.")
         else:
             if len(detections) > 1:
+                if st.session_state.get("plate_inspector_idx", 0) >= len(detections):
+                    st.session_state["plate_inspector_idx"] = 0
                 sel_idx = st.selectbox(
                     "Pilih Pelat untuk Diinspeksi",
                     range(len(detections)),
+                    key="plate_inspector_idx",
                     format_func=lambda idx: f"Pelat #{idx + 1:02d} — {detections[idx]['plate_text']} ({detections[idx]['plate_color']})",
                 )
             else:
@@ -524,12 +551,14 @@ else:
             tax_disp = det["tax_text"] if det["tax_text"] != "TIDAK TERBACA" else "--.--"
 
             st.markdown(
-                f"""
-            <div class="plate-replica {theme_cls}">
-                <div class="plate-main-txt">{det['plate_text']}</div>
-                <div class="plate-tax-txt">{tax_disp}</div>
-            </div>
-            """,
+                textwrap.dedent(
+                    f"""
+                    <div class="plate-replica {theme_cls}">
+                    <div class="plate-main-txt">{det['plate_text']}</div>
+                    <div class="plate-tax-txt">{tax_disp}</div>
+                    </div>
+                    """
+                ).strip(),
                 unsafe_allow_html=True,
             )
 
@@ -552,48 +581,22 @@ else:
                 else ""
             )
 
-            st.markdown(
-                f"""
-            <div class="pane-box">
-                <table class="spec-table">
-                    <tr>
-                        <td class="spec-key">Nomor Utama</td>
-                        <td class="spec-val spec-mono">{det['plate_text']} &nbsp;{p_badge}</td>
-                    </tr>
-                    <tr>
-                        <td class="spec-key">[Kebaruan 1] Warna &amp; Jenis</td>
-                        <td class="spec-val">{p_color} &mdash; {det['vehicle_type']}</td>
-                    </tr>
-                    <tr>
-                        <td class="spec-key">[Kebaruan 2] Masa Pajak</td>
-                        <td class="spec-val spec-mono">{det['tax_text']} &nbsp;{t_badge}</td>
-                    </tr>
-                    <tr>
-                        <td class="spec-key">Koreksi Kemiringan</td>
-                        <td class="spec-val">{det['deskew_status']}</td>
-                    </tr>
-                    <tr>
-                        <td class="spec-key">Pangkas Pinggiran Plat</td>
-                        <td class="spec-val">{det.get('trim_status', 'Tidak dipangkas')}</td>
-                    </tr>
-                    <tr>
-                        <td class="spec-key">Standar Polaritas</td>
-                        <td class="spec-val">{det['polarity_status']}</td>
-                    </tr>
-                    <tr>
-                        <td class="spec-key">Rasio Aspek &amp; Keutuhan</td>
-                        <td class="spec-val spec-mono">{det['aspect_ratio']:.2f}:1 &middot; {det['status']}</td>
-                    </tr>
-                    <tr>
-                        <td class="spec-key">Sumber OCR Pemenang</td>
-                        <td class="spec-val">{det['ocr_source']}</td>
-                    </tr>
-                    {gt_row}
-                </table>
-            </div>
-            """,
-                unsafe_allow_html=True,
+            spec_html = (
+                '<div class="pane-box">'
+                '<table class="spec-table">'
+                f'<tr><td class="spec-key">Nomor Utama</td><td class="spec-val spec-mono">{det["plate_text"]} &nbsp;{p_badge}</td></tr>'
+                f'<tr><td class="spec-key">[Kebaruan 1] Warna &amp; Jenis</td><td class="spec-val">{p_color} &mdash; {det["vehicle_type"]}</td></tr>'
+                f'<tr><td class="spec-key">[Kebaruan 2] Masa Pajak</td><td class="spec-val spec-mono">{det["tax_text"]} &nbsp;{t_badge}</td></tr>'
+                f'<tr><td class="spec-key">Koreksi Kemiringan</td><td class="spec-val">{det["deskew_status"]}</td></tr>'
+                f'<tr><td class="spec-key">Pangkas Pinggiran Plat</td><td class="spec-val">{det.get("trim_status", "Tidak dipangkas")}</td></tr>'
+                f'<tr><td class="spec-key">Standar Polaritas</td><td class="spec-val">{det["polarity_status"]}</td></tr>'
+                f'<tr><td class="spec-key">Rasio Aspek &amp; Keutuhan</td><td class="spec-val spec-mono">{det["aspect_ratio"]:.2f}:1 &middot; {det["status"]}</td></tr>'
+                f'<tr><td class="spec-key">Sumber OCR Pemenang</td><td class="spec-val">{det["ocr_source"]}</td></tr>'
+                f'{gt_row}'
+                '</table>'
+                '</div>'
             )
+            st.markdown(spec_html, unsafe_allow_html=True)
 
             if det["all_candidates"]:
                 st.markdown('<span class="pane-label">Komparasi Kandidat OCR (Voting)</span>', unsafe_allow_html=True)

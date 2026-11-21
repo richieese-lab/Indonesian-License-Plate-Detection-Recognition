@@ -274,12 +274,48 @@ def _long_lines(ink, length, horizontal):
     return cv2.morphologyEx(pre, cv2.MORPH_OPEN, k)
 
 
-def _has_char_between(ink, ty1, ty2, xa, xb, char_h):
-    """Cek apakah di antara garis tegak dan kotak huruf masih ada huruf (huruf pertama/terakhir yang tidak ikut terdeteksi)."""
+def _has_char_between(ink, ty1, ty2, xa, xb, char_h, tax_y2=None):
+    """Cek apakah di antara garis tegak dan kotak huruf masih ada huruf utama atau angka pajak."""
     if xb - xa < 2:
         return False
     n, _, st, _ = cv2.connectedComponentsWithStats((ink[ty1:ty2, xa:xb] > 0).astype(np.uint8), 8)
-    return any(st[i][3] >= 0.5 * char_h and st[i][4] >= 0.1 * char_h * char_h for i in range(1, n))
+    if any(st[i][3] >= 0.5 * char_h and st[i][4] >= 0.1 * char_h * char_h for i in range(1, n)):
+        return True
+    if tax_y2 is not None and tax_y2 > ty2:
+        n2, _, st2, _ = cv2.connectedComponentsWithStats((ink[ty2:tax_y2, xa:xb] > 0).astype(np.uint8), 8)
+        if any(st2[i][3] >= 0.35 * char_h and st2[i][4] >= 0.05 * char_h * char_h for i in range(1, n2)):
+            return True
+    return False
+
+
+def _tax_content_bounds(text_mask, tx1, ty2, tx2, ch):
+    """
+    Cari batas kanan & bawah angka pajak (MM • YY) di bawah nomor utama agar pemangkasan
+    tepi tidak memotong digit tahun pajak yang sering sejajar atau lebih ke kanan dari tx2.
+    """
+    h, w = text_mask.shape
+    tax_end = min(h - 1, int(ty2 + 0.65 * ch))
+    tax_bot_lim = min(h, int(ty2 + 1.35 * ch))
+    if tax_bot_lim <= ty2:
+        return tx2, tax_end
+    n, _, st, _ = cv2.connectedComponentsWithStats(text_mask.astype(np.uint8), 8)
+    min_x = tx1 + int(0.35 * (tx2 - tx1))
+    min_h = max(5.0, 0.35 * ch)
+    min_area = max(8.0, 0.05 * ch * ch)
+    tax_x2, tax_y2 = tx2, tax_end
+    for i in range(1, n):
+        sx, sy, sw, sh, area = int(st[i][0]), int(st[i][1]), int(st[i][2]), int(st[i][3]), int(st[i][4])
+        if sy < max(0, ty2 - 2) or (sy + sh) > tax_bot_lim:
+            continue
+        if not (min_h <= sh <= 0.80 * ch and 2 <= sw <= 0.22 * w and sh >= 0.6 * sw):
+            continue
+        if sx < min_x or (sx + sw) >= int(0.95 * w) or area < min_area:
+            continue
+        if not (0.15 <= area / float(sw * sh) <= 0.88):
+            continue
+        tax_x2 = max(tax_x2, sx + sw)
+        tax_y2 = max(tax_y2, sy + sh)
+    return tax_x2, min(h - 1, tax_y2)
 
 
 def trim_plate_margins(plate_bgr):
@@ -288,13 +324,14 @@ def trim_plate_margins(plate_bgr):
 
     Cara kerja (integral proyeksi, P17):
       1. Pisahkan latar plat dan tulisan (Otsu dari bagian tengah plat).
-      2. Cari kotak huruf nomor utama. Kotak ini jadi titik awal dan batas aman.
-      3. Dari tepi kotak huruf, telusuri profil baris ke atas dan ke bawah, dan profil kolom
+      2. Cari kotak huruf nomor utama serta batas angka pajak (MM • YY) di bawahnya.
+      3. Dari tepi kotak huruf/pajak, telusuri profil baris ke atas dan ke bawah, dan profil kolom
          ke kiri dan ke kanan. Begitu ketemu baris/kolom yang hampir tidak berisi latar plat
          (garis bingkai), di situlah tepi plat.
          Penelusuran dari dalam ke luar, bukan dari luar ke dalam, karena bodi mobil di luar
          bingkai bisa saja warnanya sama dengan latar plat (mobil putih, plat putih).
-      4. Ke bawah, titik awalnya digeser melewati baris angka pajak supaya tidak ikut terpotong.
+      4. Ke bawah dan ke kanan, titik awalnya memperhitungkan baris angka pajak supaya digit
+         terakhir pajak tidak ikut terpotong, disertai ruang aman beberapa piksel di luar teks.
       5. Garis bingkai tipis dicari juga dengan opening morfologi (P13-14), karena di profil
          latar garis setipis itu kurang kelihatan.
     Return: (citra_terpangkas, (y1, y2, x1, x2), status)
@@ -316,11 +353,11 @@ def trim_plate_margins(plate_bgr):
     # memotong huruf, jadi lebih aman dibiarkan.
     if (tx2 - tx1) < 0.5 * w:
         return plate_bgr, (0, h, 0, w), "Tidak dipangkas (huruf hanya terdeteksi sebagian)"
+    tax_x2, tax_end = _tax_content_bounds(~bg, tx1, ty2, tx2, ch)
     bgf = bg.astype(np.float32)
 
     rows = bgf[:, tx1:tx2].mean(axis=1)
     top = _scan_until_border(rows, ty1 - max(1, int(0.08 * ch)), -1, TRIM_ROW_THR)
-    tax_end = min(h - 1, int(ty2 + 0.55 * ch))
     bottom = _scan_until_border(rows, tax_end, +1, TRIM_ROW_THR)
     y1 = 0 if top is None else top + 1
     y2 = h if bottom is None else bottom
@@ -330,7 +367,7 @@ def trim_plate_margins(plate_bgr):
     cols = bgf[y1:y2, :].mean(axis=0)
     mx = max(1, int(0.15 * ch))
     left = _scan_until_border(cols, tx1 - mx, -1, TRIM_COL_THR, run=2)
-    right = _scan_until_border(cols, tx2 + mx, +1, TRIM_COL_THR, run=2)
+    right = _scan_until_border(cols, tax_x2 + mx, +1, TRIM_COL_THR, run=2)
     x1 = 0 if left is None else left + 1
     x2 = w if right is None else right
 
@@ -339,25 +376,35 @@ def trim_plate_margins(plate_bgr):
     # digeser ke garis terdalam yang masih di luar teks.
     ink = _ink_mask(blur, bright_bg)
     hl = _long_lines(ink, 0.45 * (tx2 - tx1), horizontal=True)
-    vl = _long_lines(ink, 1.25 * ch, horizontal=False)
+    vl = _long_lines(ink, 0.90 * ch, horizontal=False)
     row_line = (hl[:, tx1:tx2] > 0).mean(axis=1)
-    col_line = (vl > 0).mean(axis=0)
+    col_line = (vl[y1:y2, :] > 0).mean(axis=0)
     above = [y for y in range(0, max(0, ty1 - 1)) if row_line[y] > 0.3]
-    below = [y for y in range(tax_end, h) if row_line[y] > 0.3]
+    below = [y for y in range(min(h, tax_end + 1), h) if row_line[y] > 0.3]
     if above:
         y1 = max(y1, max(above) + 1)
     if below:
         y2 = min(y2, min(below))
-    # garis tegak hanya dipakai kalau di antara garis itu dan kotak huruf tidak ada huruf lagi,
-    # karena huruf pertama/terakhir yang menempel bingkai kadang tidak masuk kotak huruf
-    for x in sorted((x for x in range(0, max(0, tx1 - 1)) if col_line[x] > 0), reverse=True):
-        if not _has_char_between(ink, ty1, ty2, x + 1, tx1 - 1, ch):
+    # garis tegak hanya dipakai kalau di antara garis itu dan kotak huruf/pajak tidak ada huruf lagi
+    left_limit = min(max(0, tx1 - 1), int(0.14 * w))
+    for x in sorted((x for x in range(0, left_limit) if col_line[x] > 0.25), reverse=True):
+        if not _has_char_between(ink, ty1, ty2, x + 1, tx1 - 1, ch, tax_y2=tax_end):
             x1 = max(x1, x + 1)
             break
-    for x in sorted(x for x in range(tx2 + 1, w) if col_line[x] > 0):
-        if not _has_char_between(ink, ty1, ty2, tx2 + 1, x, ch):
+    right_start = max(tax_x2 + 1, int(0.86 * w))
+    for x in sorted(x for x in range(right_start, w) if col_line[x] > 0.25):
+        if not _has_char_between(ink, ty1, ty2, tax_x2 + 1, x, ch, tax_y2=tax_end):
             x2 = min(x2, x)
             break
+
+    # Jaga ruang aman di luar huruf utama & baris pajak agar efek dilasi garis atau kemiringan
+    # perspektif tidak memotong sisi kanan angka tahun pajak (mis. digit '5' pada 12•25).
+    pad_x = max(2, int(0.16 * ch))
+    pad_y = max(2, int(0.14 * ch))
+    x1 = min(x1, max(0, tx1 - pad_x))
+    x2 = max(x2, min(w, tax_x2 + pad_x))
+    y1 = min(y1, max(0, ty1 - pad_y))
+    y2 = max(y2, min(h, tax_end + pad_y))
 
     # batas aman: pinggiran non-plat tidak pernah selebar ini, kalau lebih berarti salah baca
     x1, x2 = min(x1, int(0.15 * w)), max(x2, int(0.85 * w))
@@ -369,11 +416,11 @@ def trim_plate_margins(plate_bgr):
 
 
 # ======================================================================
-# TODO: Modul Deteksi Warna Pelat (HSV) -> Jenis Kendaraan
+# Modul Deteksi Warna Pelat (HSV) -> Jenis Kendaraan (Kebaruan 1)
 # ======================================================================
 class PlateColorClassifier:
     """
-    TODO: Implementasikan deteksi warna pelat nomor berbasis ruang warna HSV.
+    Deteksi warna pelat nomor berbasis ruang warna HSV (Materi P4).
     Target kelas warna:
       - Hitam  : Kendaraan Pribadi (Pelat Hitam)
       - Putih  : Kendaraan Pribadi (Pelat Putih)
@@ -382,11 +429,50 @@ class PlateColorClassifier:
     """
 
     def classify(self, deskewed_bgr):
-        # TODO: Implementasikan logika deteksi warna pelat (HSV) di sini.
+        if deskewed_bgr is None or deskewed_bgr.size == 0:
+            return {
+                "plate_color": "Hitam",
+                "vehicle_type": VEHICLE_TYPE["Hitam"],
+                "hsv_summary": "Citra kosong",
+            }
+
+        st = _plate_stats(deskewed_bgr)
+        text_brighter = st["fg_y"] > st["bg_y"]
+
+        yellow_strong = (st["yellow_ratio"] >= 0.85 and st["bg_s"] >= 110 and st["bg_v"] >= 95)
+        red_plate = (
+            st["red_ratio"] >= 0.25
+            and st["bg_s"] >= 60
+            and st["bg_v"] >= 55
+            and (text_brighter or st["fg_v"] >= st["bg_v"] - 10)
+        )
+        yellow_plate = yellow_strong or (
+            st["yellow_ratio"] >= 0.45
+            and not text_brighter
+            and (
+                st["bg_s"] >= 95
+                or (st["bg_s"] >= 70 and st["bg_v"] < 185)
+                or (st["bg_s"] >= 55 and st["bg_v"] < 110)
+            )
+        )
+
+        if red_plate:
+            color = "Merah"
+        elif yellow_plate:
+            color = "Kuning"
+        elif abs(st["bg_y"] - st["fg_y"]) >= 12.0:
+            color = "Hitam" if text_brighter else "Putih"
+        else:
+            color = "Putih" if st["bg_v"] >= 125 else "Hitam"
+
+        summary = (
+            f"Latar H={st['bg_h']} S={st['bg_s']} V={st['bg_v']} | "
+            f"Merah {st['red_ratio']:.0%}, Kuning {st['yellow_ratio']:.0%}"
+        )
         return {
-            "plate_color": "TODO",
-            "vehicle_type": "TODO: Klasifikasi Jenis Kendaraan",
-            "hsv_summary": "TODO: Deteksi warna pelat belum diimplementasikan",
+            "plate_color": color,
+            "vehicle_type": VEHICLE_TYPE[color],
+            "hsv_summary": summary,
         }
 
 
