@@ -51,7 +51,7 @@ class CustomPlateRecognizer:
     sehingga dapat langsung menggantikan EasyOCR pada aplikasi utama.
     """
 
-    def __init__(self, model_path=None, use_gpu=False, conf_threshold=0.25):
+    def __init__(self, model_path=None, use_gpu=False, conf_threshold=0.25, hybrid_tax=True):
         base_dir = Path(__file__).resolve().parent
         if model_path is None:
             candidates = [
@@ -68,6 +68,13 @@ class CustomPlateRecognizer:
         self.device = 0 if use_gpu else "cpu"
         self.conf_threshold = conf_threshold
         self.model = YOLO(str(self.model_path))
+        self.tax_recognizer = None
+        if hybrid_tax:
+            try:
+                from Script.recognizer import PlateRecognizer
+                self.tax_recognizer = PlateRecognizer(use_gpu=use_gpu)
+            except Exception as exc:
+                print(f"[CustomPlateRecognizer] Hybrid tax fallback ke YOLOv8 ({exc})")
 
     @staticmethod
     def clean_text(text):
@@ -226,6 +233,8 @@ class CustomPlateRecognizer:
                         continue
                     suffix = "".join(s_chars)
 
+                    if edits > 2:
+                        continue
                     candidate = (edits, -len(prefix), -len(number), f"{prefix} {number} {suffix}")
                     if best_full is None or candidate < best_full:
                         best_full = candidate
@@ -255,29 +264,34 @@ class CustomPlateRecognizer:
                 "char_boxes": [],
             }
 
-        sources = [("Citra Utama (Custom YOLOv8 OCR)", image_input)]
+        sources = [("Citra Utama (Custom YOLOv8 OCR)", image_input, True)]
         if fallback_image is not None:
-            sources.append(("Grayscale Tajam", fallback_image))
+            sources.append(("Grayscale Tajam", fallback_image, True))
         if extra_images:
             for idx, im in enumerate(extra_images):
                 if im is not None:
-                    sources.append((f"Varian #{idx + 1}", im))
+                    sources.append((f"Varian #{idx + 1}", im, False))
 
         candidates = []
-        for name, img in sources:
-            for inv_tag, cur_img in (("", img), (" [Invert]", cv2.bitwise_not(img))):
+        fmt_counts = {}
+        for name, img, allow_invert in sources:
+            img_passes = (("", img), (" [Invert]", cv2.bitwise_not(img))) if allow_invert else (("", img),)
+            for inv_tag, cur_img in img_passes:
                 raw, conf, cboxes = self.detect_characters(cur_img, main_row_only=True)
                 if not raw:
                     continue
                 fmt, val, occ = self.parse_and_validate_plate(raw)
                 if fmt and fmt != "TIDAK TERBACA":
+                    key = fmt.replace(" ", "")
+                    if val:
+                        fmt_counts[key] = fmt_counts.get(key, 0) + 1
                     candidates.append({
                         "source": f"{name}{inv_tag}",
                         "raw": raw,
                         "fmt": fmt,
                         "conf": round(conf, 3),
                         "regex_ok": bool(val),
-                        "valid": bool(val and conf >= 0.40),
+                        "valid": bool(val and conf >= 0.55),
                         "occ": occ,
                         "char_boxes": cboxes,
                     })
@@ -294,6 +308,11 @@ class CustomPlateRecognizer:
                 "char_boxes": [],
             }
 
+        for c in candidates:
+            key = c["fmt"].replace(" ", "")
+            if c["regex_ok"] and (c["conf"] >= 0.55 or (c["conf"] >= 0.40 and fmt_counts.get(key, 0) >= 2)):
+                c["valid"] = True
+
         valid_cands = [c for c in candidates if c["valid"]]
         pool = valid_cands if valid_cands else candidates
         best = max(pool, key=lambda c: (int(c["regex_ok"]), len(c["fmt"].replace(" ", "")), c["conf"]))
@@ -309,55 +328,91 @@ class CustomPlateRecognizer:
             "char_boxes": best["char_boxes"],
         }
 
-    def recognize_tax(self, tax_binary, tax_gray=None, tax_gray_clahe=None):
+    @staticmethod
+    def _prepare_tax_crop(img):
+        """Ambil sisi kanan ROI pajak (buang garis bingkai kiri) dan beri padding agar rasio ~1:3."""
+        if img is None or img.size == 0:
+            return None
+        h, w = img.shape[:2]
+        right_crop = img[:, int(0.38 * w):]
+        ch, cw = right_crop.shape[:2]
+        if ch == 0 or cw == 0:
+            return None
+        target_h = max(ch, cw // 3)
+        pad_top = (target_h - ch) // 2
+        pad_bot = target_h - ch - pad_top
+        return cv2.copyMakeBorder(right_crop, pad_top, pad_bot, 8, 8, cv2.BORDER_CONSTANT, value=0)
+
+    def recognize_tax(self, tax_binary, tax_gray=None, tax_gray_clahe=None, current_date=None):
         """
-        Membaca masa berlaku pajak MM.YY pada ROI pajak menggunakan Custom YOLOv8 OCR.
+        Membaca masa berlaku pajak MM.YY pada ROI pajak.
+        Jika mode hybrid aktif, delegasikan ke EasyOCR (PlateRecognizer.recognize_tax) yang lebih
+        akurat untuk angka kecil MM.YY; jika tidak, pakai Custom YOLOv8 OCR dengan crop kanan & voting.
         """
-        now = datetime.now()
+        if self.tax_recognizer is not None:
+            return self.tax_recognizer.recognize_tax(
+                tax_binary,
+                tax_gray=tax_gray,
+                current_date=current_date,
+            )
+
+        now = current_date or datetime.now()
         cur_year, cur_month = now.year, now.month
 
         inputs = []
         if tax_gray is not None and tax_gray.size > 0:
-            inputs.append(("tax_gray", tax_gray))
+            inputs.append(("tax_gray", tax_gray, 0.10))
+            g = cv2.cvtColor(tax_gray, cv2.COLOR_BGR2GRAY) if tax_gray.ndim == 3 else tax_gray
+            clahe_tax = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(g)
+            inputs.append(("tax_clahe", clahe_tax, 0.08))
         if tax_gray_clahe is not None and tax_gray_clahe.size > 0:
-            inputs.append(("tax_clahe", tax_gray_clahe))
+            inputs.append(("tax_clahe_ext", tax_gray_clahe, 0.08))
         if tax_binary is not None and tax_binary.size > 0:
-            inputs.append(("tax_bin", tax_binary))
+            inputs.append(("tax_bin", tax_binary, 0.12))
 
-        best_pair = None
-        for _, img in inputs:
-            for cur_img in (img, cv2.bitwise_not(img)):
-                raw, conf, _ = self.detect_characters(cur_img, main_row_only=False)
-                if not raw:
-                    continue
-                digits = "".join(
-                    c if c.isdigit() else TAX_DIGIT_CORRECTIONS.get(c, "")
-                    for c in raw
+        tax_scores = {}
+        for _, img, bonus in inputs:
+            cropped = self._prepare_tax_crop(img)
+            if cropped is None:
+                continue
+            raw, conf, _ = self.detect_characters(cropped, main_row_only=False)
+            if not raw:
+                continue
+            digits = "".join(
+                c if c.isdigit() else TAX_DIGIT_CORRECTIONS.get(c, "")
+                for c in raw
+            )
+            m = re.search(r"(0[1-9]|1[0-2])([1-4][0-9])", digits)
+            if m:
+                mm, yy = int(m.group(1)), int(m.group(2))
+                fmt = f"{mm:02d}.{yy:02d}"
+                entry = tax_scores.setdefault(
+                    fmt,
+                    {"score": 0.0, "best_conf": 0.0, "month": mm, "year_full": 2000 + yy},
                 )
-                for i in range(max(0, len(digits) - 3)):
-                    sub = digits[i:i + 4]
-                    if len(sub) == 4:
-                        mm, yy = int(sub[:2]), int(sub[2:])
-                        if 1 <= mm <= 12 and 15 <= yy <= 35:
-                            if best_pair is None or conf > best_pair[0]:
-                                best_pair = (conf, mm, yy)
+                entry["score"] += 0.5 + float(conf) + bonus
+                if conf > entry["best_conf"]:
+                    entry["best_conf"] = float(conf)
 
-        if best_pair is None:
+        if not tax_scores:
             return {
-                "tax_date": "TIDAK TERBACA",
-                "tax_status": "TIDAK TERBACA",
+                "tax_text": "TIDAK TERBACA",
                 "tax_month": None,
                 "tax_year": None,
+                "is_tax_active": None,
+                "tax_status": "TIDAK TERBACA",
                 "tax_confidence": 0.0,
             }
 
-        conf, mm, yy = best_pair
-        full_year = 2000 + yy
-        is_active = (full_year > cur_year) or (full_year == cur_year and mm >= cur_month)
+        best_fmt, best_info = max(tax_scores.items(), key=lambda kv: kv[1]["score"])
+        mm = best_info["month"]
+        full_year = best_info["year_full"]
+        is_active = (full_year, mm) >= (cur_year, cur_month)
         return {
-            "tax_date": f"{mm:02d}.{yy:02d}",
-            "tax_status": "AKTIF" if is_active else "MATI",
+            "tax_text": best_fmt,
             "tax_month": mm,
             "tax_year": full_year,
-            "tax_confidence": round(float(conf), 2),
+            "is_tax_active": is_active,
+            "tax_status": "AKTIF" if is_active else "MATI / KEDALUWARSA",
+            "tax_confidence": round(best_info["best_conf"], 2),
         }

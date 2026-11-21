@@ -743,6 +743,8 @@ class PlateDetector:
             cx1, cy1 = max(0, x1 - px), max(0, y1 - py)
             context = (image[cy1:min(img_h, y2 + py), cx1:min(img_w, x2 + px)], (x1 - cx1, y1 - cy1))
             processed = self.process_crop(crop_img, context)
+            if auto_mode and conf < 0.35 and w >= 75 and "huruf tidak terdeteksi" in processed.get("trim_status", "").lower():
+                continue
             # Hitung aspek rasio: untuk pelat miring (>= 15 deg), kotak axis-aligned tampak persegi,
             # jadi evaluasi keutuhan mempertimbangkan kemiringan agar pelat miring utuh tidak dianggap terhalang.
             dw, dh = processed["deskewed"].shape[1], processed["deskewed"].shape[0]
