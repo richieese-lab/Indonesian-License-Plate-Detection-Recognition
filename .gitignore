@@ -34,6 +34,7 @@ Dataset/dataset_plate.zip
 # ==========================================
 models/*.pt
 !models/best.pt
+!models/ocr_best.pt
 models/*.onnx
 runs/
 weights/

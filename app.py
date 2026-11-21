@@ -12,7 +12,7 @@ import streamlit as st
 from Script.binarizer import PlateBinarizer
 from Script.detector import PlateDetector
 from Script.preprocessor import PlatePreprocessor
-from Script.recognizer import PlateRecognizer
+from Script.custom_ocr import CustomPlateRecognizer
 from Script.utils import draw_plate_annotations, get_ground_truth
 
 st.set_page_config(
@@ -281,7 +281,8 @@ def load_pipeline_modules():
     detector = PlateDetector()
     preprocessor = PlatePreprocessor()
     binarizer = PlateBinarizer()
-    recognizer = PlateRecognizer(use_gpu=False)
+    ocr_model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "ocr_best.pt")
+    recognizer = CustomPlateRecognizer(model_path=ocr_model_path, use_gpu=False)
     return detector, preprocessor, binarizer, recognizer
 
 
@@ -334,9 +335,9 @@ def run_full_pipeline(image_bgr, detector, preprocessor, binarizer, recognizer, 
         bin_res = binarizer.process(pre_res["sharpened"])
 
         ocr_main = recognizer.recognize(
-            bin_res["roi_cleaned"],
+            det["deskewed"],
             fallback_image=bin_res["upscaled_gray"],
-            extra_images=bin_res["variants"],
+            extra_images=[bin_res["roi_cleaned"]] + bin_res["variants"],
         )
         ocr_tax = recognizer.recognize_tax(
             bin_res["tax_roi_binary"],
