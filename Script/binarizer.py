@@ -191,23 +191,53 @@ class PlateBinarizer:
             interpolation=cv2.INTER_CUBIC,
         )
         assisted = self._tophat_assist(tax_gray_raw)
-        _, tax_bin = cv2.threshold(assisted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        if np.count_nonzero(tax_bin) > tax_bin.size * 0.55:
+        th, tw = assisted.shape[:2]
+        # Hitung ambang Otsu dari 70% sisi kanan-tengah (area angka pajak) agar garis bingkai/logo
+        # di pojok kiri bawah tidak menarik ambang Otsu terlalu tinggi.
+        otsu_zone = assisted[:, int(tw * 0.28):]
+        if otsu_zone.size == 0:
+            otsu_zone = assisted
+        t_val, _ = cv2.threshold(otsu_zone, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        _, tax_bin = cv2.threshold(assisted, t_val, 255, cv2.THRESH_BINARY)
+        if np.count_nonzero(tax_bin[:, int(tw * 0.28):]) > otsu_zone.size * 0.55:
             tax_bin = cv2.bitwise_not(tax_bin)
 
-        # Bersihkan noise mikro, garis bingkai tepi, dan sisa ujung huruf baris utama pada ROI pajak
-        th, tw = tax_bin.shape[:2]
+        # Bersihkan noise mikro, garis horizontal/bingkai kiri, dan sisa ujung huruf baris utama pada ROI pajak
         n, labels, stats, _ = cv2.connectedComponentsWithStats(tax_bin, connectivity=8)
         min_tax_area = max(10, int(th * tw * 0.002))
+        removed_mask = np.zeros((th, tw), dtype=bool)
         for i in range(1, n):
             x, y, cw, ch, area = stats[i]
             touches_border = (y <= 1 and cw > 0.25 * tw) or (y + ch >= th - 1 and cw > 0.25 * tw)
             touches_side_line = (x <= 1 or x + cw >= tw - 1) and (ch > 0.75 * th and cw <= max(4, int(tw * 0.025)))
             touches_top_main = (y <= 1 and (y + ch) < 0.28 * th)
-            if area < min_tax_area or cw > 0.55 * tw or touches_border or touches_side_line or touches_top_main:
+            is_horiz_line = (cw >= max(14, int(tw * 0.09)) and cw >= 2.5 * max(1, ch))
+            is_far_left_noise = ((x + cw) <= int(tw * 0.28))
+            if (
+                area < min_tax_area
+                or cw > 0.55 * tw
+                or touches_border
+                or touches_side_line
+                or touches_top_main
+                or is_horiz_line
+                or is_far_left_noise
+            ):
                 tax_bin[labels == i] = 0
+                if is_horiz_line or is_far_left_noise or touches_border or touches_side_line:
+                    removed_mask |= (labels == i)
 
-        tax_gray_ocr = self._to_ocr_dark_on_white(tax_gray_raw, use_clahe=False)
+        # Tutup celah 1-2 piksel pada angka pajak (mis. angka '0' yang agak putus seperti 'G'/'C')
+        tax_bin = cv2.morphologyEx(
+            tax_bin,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2)),
+        )
+
+        tax_gray_clean = tax_gray_raw.copy()
+        if removed_mask.any():
+            bg_med = int(np.median(tax_gray_clean[~removed_mask])) if (~removed_mask).any() else 0
+            tax_gray_clean[removed_mask] = bg_med
+        tax_gray_ocr = self._to_ocr_dark_on_white(tax_gray_clean, use_clahe=False)
         return self._pad(tax_bin, value=0), tax_gray_ocr
 
     def separate_main_and_tax_roi(self, morphed_bin, sharpened_gray):

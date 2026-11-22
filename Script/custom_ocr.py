@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 import cv2
 import numpy as np
+import torch
 from ultralytics import YOLO
 
 CLASSES = [
@@ -39,7 +40,7 @@ DICT_INT_TO_CHAR = {
     "0": "O", "1": "I", "2": "Z", "4": "A", "5": "S", "6": "G", "7": "T", "8": "B",
 }
 TAX_DIGIT_CORRECTIONS = {
-    "O": "0", "G": "0", "D": "0", "Q": "0", "C": "0",
+    "O": "0", "G": "0", "D": "0", "Q": "0", "C": "0", "U": "0",
     "I": "1", "L": "1", "Z": "2", "S": "5", "B": "8",
 }
 
@@ -51,7 +52,7 @@ class CustomPlateRecognizer:
     sehingga dapat langsung menggantikan EasyOCR pada aplikasi utama.
     """
 
-    def __init__(self, model_path=None, use_gpu=False, conf_threshold=0.25, hybrid_tax=True):
+    def __init__(self, model_path=None, use_gpu=None, conf_threshold=0.25, hybrid_tax=True):
         base_dir = Path(__file__).resolve().parent
         if model_path is None:
             candidates = [
@@ -65,14 +66,18 @@ class CustomPlateRecognizer:
                 f"File bobot model OCR tidak ditemukan di: {self.model_path}\n"
                 "Silakan unduh 'ocr_best.pt' hasil training Colab dari Google Drive lalu simpan di folder ini."
             )
-        self.device = 0 if use_gpu else "cpu"
+        if use_gpu is None:
+            use_gpu = torch.cuda.is_available()
+        self.use_gpu = bool(use_gpu and torch.cuda.is_available())
+        self.device = 0 if self.use_gpu else "cpu"
         self.conf_threshold = conf_threshold
+        print(f"[CustomPlateRecognizer] Memuat model OCR dari: {self.model_path} (device={self.device})")
         self.model = YOLO(str(self.model_path))
         self.tax_recognizer = None
         if hybrid_tax:
             try:
                 from Script.recognizer import PlateRecognizer
-                self.tax_recognizer = PlateRecognizer(use_gpu=use_gpu)
+                self.tax_recognizer = PlateRecognizer(use_gpu=self.use_gpu)
             except Exception as exc:
                 print(f"[CustomPlateRecognizer] Hybrid tax fallback ke YOLOv8 ({exc})")
 
@@ -264,9 +269,9 @@ class CustomPlateRecognizer:
                 "char_boxes": [],
             }
 
-        sources = [("Citra Utama (Custom YOLOv8 OCR)", image_input, True)]
+        sources = [("Citra Utama (Custom YOLOv8 OCR)", image_input, False)]
         if fallback_image is not None:
-            sources.append(("Grayscale Tajam", fallback_image, True))
+            sources.append(("Grayscale Tajam", fallback_image, False))
         if extra_images:
             for idx, im in enumerate(extra_images):
                 if im is not None:
@@ -314,8 +319,18 @@ class CustomPlateRecognizer:
                 c["valid"] = True
 
         valid_cands = [c for c in candidates if c["valid"]]
-        pool = valid_cands if valid_cands else candidates
-        best = max(pool, key=lambda c: (int(c["regex_ok"]), len(c["fmt"].replace(" ", "")), c["conf"]))
+        if valid_cands:
+            scores = {}
+            for c in valid_cands:
+                key = c["fmt"].replace(" ", "")
+                bonus = 0.25 if "Citra Utama" in c["source"] else 0.0
+                entry = scores.setdefault(key, {"score": 0.0, "best": c})
+                entry["score"] += 1.0 + c["conf"] + bonus
+                if c["conf"] > entry["best"]["conf"]:
+                    entry["best"] = c
+            best = max(scores.values(), key=lambda s: s["score"])["best"]
+        else:
+            best = max(candidates, key=lambda c: (int(c["regex_ok"]), len(c["fmt"].replace(" ", "")), c["conf"]))
 
         return {
             "raw_text": best["raw"],
@@ -350,11 +365,13 @@ class CustomPlateRecognizer:
         akurat untuk angka kecil MM.YY; jika tidak, pakai Custom YOLOv8 OCR dengan crop kanan & voting.
         """
         if self.tax_recognizer is not None:
-            return self.tax_recognizer.recognize_tax(
+            res_hybrid = self.tax_recognizer.recognize_tax(
                 tax_binary,
                 tax_gray=tax_gray,
                 current_date=current_date,
             )
+            if res_hybrid.get("tax_text") and res_hybrid["tax_text"] != "TIDAK TERBACA":
+                return res_hybrid
 
         now = current_date or datetime.now()
         cur_year, cur_month = now.year, now.month
@@ -382,17 +399,25 @@ class CustomPlateRecognizer:
                 c if c.isdigit() else TAX_DIGIT_CORRECTIONS.get(c, "")
                 for c in raw
             )
-            m = re.search(r"(0[1-9]|1[0-2])([1-4][0-9])", digits)
+            m = re.search(r"(0[1-9]|1[0-2])([0-9]{2})", digits)
             if m:
                 mm, yy = int(m.group(1)), int(m.group(2))
-                fmt = f"{mm:02d}.{yy:02d}"
-                entry = tax_scores.setdefault(
-                    fmt,
-                    {"score": 0.0, "best_conf": 0.0, "month": mm, "year_full": 2000 + yy},
-                )
-                entry["score"] += 0.5 + float(conf) + bonus
-                if conf > entry["best_conf"]:
-                    entry["best_conf"] = float(conf)
+            else:
+                m_open_zero = re.search(r"16([1-3][0-9])", digits)
+                if not m_open_zero:
+                    continue
+                mm = 10
+                yy = int(m_open_zero.group(1))
+                if yy in (26, 36) and yy > (cur_year % 100) + 5:
+                    yy -= 6
+            fmt = f"{mm:02d}.{yy:02d}"
+            entry = tax_scores.setdefault(
+                fmt,
+                {"score": 0.0, "best_conf": 0.0, "month": mm, "year_full": 2000 + yy},
+            )
+            entry["score"] += 0.5 + float(conf) + bonus
+            if conf > entry["best_conf"]:
+                entry["best_conf"] = float(conf)
 
         if not tax_scores:
             return {

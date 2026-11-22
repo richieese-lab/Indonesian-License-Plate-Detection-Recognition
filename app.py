@@ -277,12 +277,12 @@ st.markdown(
 
 @st.cache_resource
 def load_pipeline_modules():
-    """Memuat seluruh modul pipeline 11-tahap sekali saja."""
-    detector = PlateDetector()
+    """Memuat seluruh modul pipeline 11-tahap sekali saja (otomatis memakai GPU CUDA jika tersedia)."""
+    detector = PlateDetector(use_gpu=None)
     preprocessor = PlatePreprocessor()
     binarizer = PlateBinarizer()
     ocr_model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "ocr_best.pt")
-    recognizer = CustomPlateRecognizer(model_path=ocr_model_path, use_gpu=False)
+    recognizer = CustomPlateRecognizer(model_path=ocr_model_path, use_gpu=None)
     return detector, preprocessor, binarizer, recognizer
 
 

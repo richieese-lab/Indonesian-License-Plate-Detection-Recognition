@@ -37,7 +37,7 @@ DICT_INT_TO_CHAR = {
     "0": "O", "1": "I", "2": "Z", "4": "A", "5": "S", "6": "G", "7": "T", "8": "B",
 }
 TAX_DIGIT_CORRECTIONS = {
-    "O": "0", "G": "0", "D": "0", "Q": "0", "C": "0",
+    "O": "0", "G": "0", "D": "0", "Q": "0", "C": "0", "U": "0",
     "I": "1", "L": "1",
     "Z": "2",
     "S": "5",
@@ -356,6 +356,7 @@ class PlateRecognizer:
         tax_scores = {}
         for _, im, bonus in inputs:
             ocr_im = self._prepare_for_ocr(im)
+            im_h, im_w = ocr_im.shape[:2]
             results = self.reader.readtext(
                 ocr_im,
                 allowlist="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ.-",
@@ -367,23 +368,41 @@ class PlateRecognizer:
             )
             if not results:
                 continue
-            ordered = sorted(results, key=lambda r: min(pt[0] for pt in r[0]))
+            # Abaikan deteksi di 25% ujung kiri (area logo dealer/garis bingkai kiri bawah)
+            valid_boxes = [
+                r for r in results
+                if max(pt[0] for pt in r[0]) >= 0.25 * im_w
+            ]
+            if not valid_boxes:
+                continue
+            ordered = sorted(valid_boxes, key=lambda r: min(pt[0] for pt in r[0]))
             raw_joined = "".join(t for _, t, _ in ordered)
             avg_conf = float(np.mean([c for _, _, c in ordered]))
             digits_only = re.sub(r"[^0-9]", "", self._correct_tax_digits(raw_joined))
 
-            m = re.search(r"(0[1-9]|1[0-2])([1-4][0-9])", digits_only)
+            m = re.search(r"(0[1-9]|1[0-2])([0-9]{2})", digits_only)
             if m:
                 month, year_short = int(m.group(1)), int(m.group(2))
-                year_full = 2000 + year_short
-                tax_fmt = f"{month:02d}.{year_short:02d}"
-                entry = tax_scores.setdefault(
-                    tax_fmt,
-                    {"score": 0.0, "best_conf": 0.0, "month": month, "year_full": year_full},
-                )
-                entry["score"] += 0.5 + avg_conf + bonus
-                if avg_conf > entry["best_conf"]:
-                    entry["best_conf"] = avg_conf
+            else:
+                # Font ketok angka '0' pada pelat motor putih sering bercelah di kanan atas
+                # sehingga terbaca '6' (misal '10.30' terbaca '1636' atau '1630').
+                m_open_zero = re.search(r"16([1-3][0-9])", digits_only)
+                if not m_open_zero:
+                    continue
+                month = 10
+                year_short = int(m_open_zero.group(1))
+                if year_short in (26, 36) and year_short > (now.year % 100) + 5:
+                    year_short -= 6
+
+            year_full = 2000 + year_short
+            tax_fmt = f"{month:02d}.{year_short:02d}"
+            entry = tax_scores.setdefault(
+                tax_fmt,
+                {"score": 0.0, "best_conf": 0.0, "month": month, "year_full": year_full},
+            )
+            entry["score"] += 0.5 + avg_conf + bonus
+            if avg_conf > entry["best_conf"]:
+                entry["best_conf"] = avg_conf
 
         if not tax_scores:
             return {

@@ -3,6 +3,7 @@ import sys
 import glob
 import cv2
 import numpy as np
+import torch
 from ultralytics import YOLO
 
 # ======================================================================
@@ -112,6 +113,31 @@ def estimate_skew(plate_bgr, max_angle=MAX_SKEW_DEG):
     fine = np.arange(best - 1.0, best + 1.01, 0.25)
     best = max(fine, key=score)
     gain = score(best) / base if base > 0 else 1.0
+
+    # Fallback jika Otsu global terkecoh blok terang/gelap di sudut crop (mis. helm / latar malam):
+    # pakai TopHat + BlackHat agar hanya goresan seukuran huruf yang dihitung.
+    if abs(best) < MIN_SKEW_DEG or gain < MIN_SKEW_GAIN:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        comb = np.maximum(
+            cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, k),
+            cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, k),
+        )
+        _, th_mask = cv2.threshold(comb, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        th_mask = th_mask[int(mh * .05):int(mh * .95), int(mw * .03):int(mw * .97)]
+        if th_mask.size > 0:
+            def score_th(a):
+                r = _rotate(th_mask, a, border=cv2.BORDER_CONSTANT)
+                return float(np.var(r.sum(axis=1, dtype=np.float64)))
+            base_th = score_th(0.0)
+            lim = min(max_angle, 28.0)
+            c2 = np.arange(-lim, lim + 0.1, 1.0)
+            b2 = max(c2, key=score_th)
+            f2 = np.arange(b2 - 1.0, b2 + 1.01, 0.25)
+            b2 = max(f2, key=score_th)
+            g2 = score_th(b2) / base_th if base_th > 0 else 1.0
+            if abs(b2) >= MIN_SKEW_DEG and g2 >= MIN_SKEW_GAIN:
+                return float(np.clip(b2, -max_angle, max_angle)), g2
+
     return float(np.clip(best, -max_angle, max_angle)), gain
 
 
@@ -153,18 +179,30 @@ def _tighten_after_rotation(img, angle, box_w, box_h, margin=0.06):
 
 def _plate_stats(plate_bgr):
     """
-    Pisahkan latar dan tulisan pakai Otsu di grayscale (kelompok piksel terbanyak = latar),
-    lalu ukur warnanya. Fungsi ini deterministik, jadi klasifikasi warna dan polaritas
-    yang sama-sama memanggilnya pasti dapat hasil yang konsisten.
+    Pisahkan latar dan tulisan pakai Otsu di grayscale pada pita baris huruf utama
+    (y=18%..58%, x=12%..88% agar casing/bingkai hitam tebal di bawah tidak mendominasi),
+    serta verifikasi komponen huruf: jika komponen tulisan berwarna hitam/gelap, maka
+    latar pelat pasti terang (putih/kuning).
     """
     h, w = plate_bgr.shape[:2]
-    inner = plate_bgr[int(h * .15):int(h * .85), int(w * .05):int(w * .95)]
+    inner = plate_bgr[int(h * .18):int(h * .58), int(w * .12):int(w * .88)]
     if inner.size == 0:
         inner = plate_bgr
     gray = _to_gray(inner)
-    _, m = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    t, m = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     bright = m > 0
-    bg = bright if bright.mean() >= 0.5 else ~bright
+
+    full_gray = _to_gray(plate_bgr)
+    dark_box = _main_text_box(full_gray <= t)
+    light_box = _main_text_box(full_gray > t)
+    if dark_box is not None and light_box is None:
+        is_bright_bg = True
+    elif light_box is not None and dark_box is None:
+        is_bright_bg = False
+    else:
+        is_bright_bg = bright.mean() >= 0.5
+
+    bg = bright if is_bright_bg else ~bright
     fg = ~bg
     if not fg.any():
         fg = bg
@@ -197,14 +235,23 @@ TRIM_COL_THR = 0.22     # sama untuk kolom (lebih rendah karena goresan huruf te
 
 def _plate_bg_mask(gray):
     """
-    Mask latar plat. Ambang Otsu dihitung dari bagian tengah plat saja (pasti isinya plat),
-    lalu kelompok yang paling banyak di tengah itu dianggap warna latar.
+    Mask latar plat. Ambang Otsu dihitung dari pita baris huruf utama (18%..58% tinggi),
+    dan divalidasi dengan deteksi komponen karakter: jika tulisan berwarna gelap, latar pasti terang.
     Return: (mask_latar, latar_terang)
     """
     h, w = gray.shape
-    seed = gray[int(h * .25):int(h * .75), int(w * .2):int(w * .8)]
+    seed = gray[int(h * .18):int(h * .58), int(w * .12):int(w * .88)]
+    if seed.size == 0:
+        seed = gray
     t, sb = cv2.threshold(seed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    bright_bg = (sb > 0).mean() >= 0.5
+    dark_box = _main_text_box(gray <= t)
+    light_box = _main_text_box(gray > t)
+    if dark_box is not None and light_box is None:
+        bright_bg = True
+    elif light_box is not None and dark_box is None:
+        bright_bg = False
+    else:
+        bright_bg = (sb > 0).mean() >= 0.5
     return ((gray > t) if bright_bg else (gray <= t)), bright_bg
 
 
@@ -485,9 +532,13 @@ class PlateDetector:
     Alur per plat: YOLO -> crop -> deskew -> warna plat (HSV) -> standar polaritas.
     Rasio aspek dipakai untuk menandai plat yang terhalang / tidak utuh.
     """
-    def __init__(self, model_path=None, conf_threshold=None):
+    def __init__(self, model_path=None, conf_threshold=None, use_gpu=None):
         # None = mode otomatis (kalibrasi ambang adaptif di detect())
         self.conf_threshold = conf_threshold
+        if use_gpu is None:
+            use_gpu = torch.cuda.is_available()
+        self.use_gpu = bool(use_gpu and torch.cuda.is_available())
+        self.device = 0 if self.use_gpu else "cpu"
 
         # Urutan pencarian bobot: models/best.pt -> models/license_plate_detector.pt -> yolov8n.pt
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -504,7 +555,7 @@ class PlateDetector:
             # yolov8n bawaan akan di-download otomatis oleh Ultralytics kalau belum ada
             self.model_path = "yolov8n.pt"
 
-        print(f"[PlateDetector] Memuat model YOLO dari: {self.model_path}")
+        print(f"[PlateDetector] Memuat model YOLO dari: {self.model_path} (device={self.device})")
         self.model = YOLO(self.model_path)
 
         # yolov8n bawaan dilatih di COCO (80 kelas: mobil, orang, dst.), tidak punya kelas plat
@@ -584,7 +635,54 @@ class PlateDetector:
             inverted = diff > 0
             reason = "latar lebih terang dari tulisan" if inverted else "latar sudah lebih gelap dari tulisan"
 
-        out = cv2.bitwise_not(deskewed_bgr) if inverted else deskewed_bgr.copy()
+        if inverted:
+            out = cv2.bitwise_not(deskewed_bgr)
+            # Cegah casing/bingkai hitam di luar area pelat putih/kuning berubah menjadi
+            # blok putih terang setelah bitwise_not, TANPA menghapus isi huruf di dalam pelat.
+            gray = _to_gray(deskewed_bgr)
+            h, w = gray.shape[:2]
+            inner = gray[int(h * .18):int(h * .58), int(w * .12):int(w * .88)]
+            if inner.size == 0:
+                inner = gray
+            t, _ = cv2.threshold(inner, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            bright_mask = gray > t
+
+            # Cari batas kotak pelat terang [py1:py2, px1:px2] dari baris huruf utama
+            row_bright = bright_mask[:, int(w * .12):int(w * .88)].mean(axis=1)
+            band_top, band_bot = int(h * .15), max(int(h * .15) + 1, int(h * .60))
+            y_seed = int(np.argmax(row_bright[band_top:band_bot])) + band_top
+            top_cut = _scan_until_border(row_bright, y_seed, -1, 0.28)
+            bot_cut = _scan_until_border(row_bright, y_seed, +1, 0.28)
+            py1 = (0 if top_cut is None else top_cut + 1) + 1
+            py2 = (h if bot_cut is None else bot_cut) - 1
+
+            if py2 > py1 + 4:
+                col_bright = bright_mask[py1:py2, :].mean(axis=0)
+                left_cut = _scan_until_border(col_bright, w // 2, -1, 0.20, run=2)
+                right_cut = _scan_until_border(col_bright, w // 2, +1, 0.20, run=2)
+                px1 = (0 if left_cut is None else left_cut + 1) + 1
+                px2 = (w if right_cut is None else right_cut) - 1
+            else:
+                py1, py2, px1, px2 = 1, h - 1, 1, w - 1
+
+            # Lindungi seluruh area dalam pelat utama [py1:py2, px1:px2] + jendela pajak putih
+            plate_interior = np.zeros((h, w), dtype=bool)
+            if py2 > py1 and px2 > px1:
+                plate_interior[py1:py2, px1:px2] = True
+            tax_plate = cv2.morphologyEx(
+                bright_mask.astype(np.uint8) * 255,
+                cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_RECT, (9, 3)),
+            )
+            tax_plate = cv2.erode(tax_plate, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))) > 0
+            plate_interior |= tax_plate
+
+            casing = (~bright_mask) & (~plate_interior)
+            if casing.any() and bright_mask.any():
+                bg_val = np.median(out[bright_mask], axis=0).astype(np.uint8)
+                out[casing] = bg_val
+        else:
+            out = deskewed_bgr.copy()
         status = ("Di-invert" if inverted else "Tidak di-invert") + f" ({reason})"
         return out, inverted, status
 
@@ -655,6 +753,7 @@ class PlateDetector:
             conf=infer_conf,
             iou=0.45,
             imgsz=infer_imgsz,
+            device=self.device,
             verbose=False,
         )
         boxes = []
