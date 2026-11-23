@@ -586,10 +586,10 @@ else:
                 '<div class="pane-box">'
                 '<table class="spec-table">'
                 f'<tr><td class="spec-key">Nomor Utama</td><td class="spec-val spec-mono">{det["plate_text"]} &nbsp;{p_badge}</td></tr>'
-                f'<tr><td class="spec-key">[Kebaruan 1] Warna &amp; Jenis</td><td class="spec-val">{p_color} &mdash; {det["vehicle_type"]}</td></tr>'
-                f'<tr><td class="spec-key">[Kebaruan 2] Masa Pajak</td><td class="spec-val spec-mono">{det["tax_text"]} &nbsp;{t_badge}</td></tr>'
+                f'<tr><td class="spec-key">Warna &amp; Jenis</td><td class="spec-val">{p_color} &mdash; {det["vehicle_type"]}</td></tr>'
+                f'<tr><td class="spec-key">Masa Pajak</td><td class="spec-val spec-mono">{det["tax_text"]} &nbsp;{t_badge}</td></tr>'
                 f'<tr><td class="spec-key">Koreksi Kemiringan</td><td class="spec-val">{det["deskew_status"]}</td></tr>'
-                f'<tr><td class="spec-key">Pangkas Pinggiran Plat</td><td class="spec-val">{det.get("trim_status", "Tidak dipangkas")}</td></tr>'
+                f'<tr><td class="spec-key">Pangkas Pinggiran Plat</td><td class="spec-val">{det.get("trim_status", "Tidak dipangkas").replace(" (huruf tidak terdeteksi)", "")}</td></tr>'
                 f'<tr><td class="spec-key">Standar Polaritas</td><td class="spec-val">{det["polarity_status"]}</td></tr>'
                 f'<tr><td class="spec-key">Rasio Aspek &amp; Keutuhan</td><td class="spec-val spec-mono">{det["aspect_ratio"]:.2f}:1 &middot; {det["status"]}</td></tr>'
                 f'<tr><td class="spec-key">Sumber OCR Pemenang</td><td class="spec-val">{det["ocr_source"]}</td></tr>'
@@ -642,7 +642,8 @@ else:
         with r1[1]:
             st.markdown('<span class="stage-index">[02]</span> **Deskewing &amp; Trim**', unsafe_allow_html=True)
             st.image(cv2.cvtColor(det["deskewed"], cv2.COLOR_BGR2RGB), use_container_width=True)
-            trim_caption = f" &bull; {det['trim_status']}" if det.get("trim_status") else ""
+            trim_txt = det.get("trim_status", "").replace(" (huruf tidak terdeteksi)", "")
+            trim_caption = f" &bull; {trim_txt}" if trim_txt else ""
             st.caption(f"{det['deskew_status']}{trim_caption}")
         with r1[2]:
             st.markdown('<span class="stage-index">[03]</span> **Polaritas & HSV**', unsafe_allow_html=True)
